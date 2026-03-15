@@ -1,14 +1,14 @@
-import { CapacitorSQLite, SQLiteConnection } from '@capacitor-community/sqlite';
 import { SCHEMA_SQL } from './schema.js';
 
 const DB_NAME = 'darts501';
 let db = null;
-let sqlite = null;
 
 export async function initDatabase() {
     if (db) return db;
 
-    sqlite = new SQLiteConnection(CapacitorSQLite);
+    const { CapacitorSQLite, SQLiteConnection } = await import('@capacitor-community/sqlite');
+
+    const sqlite = new SQLiteConnection(CapacitorSQLite);
 
     const isConn = await sqlite.isConnection(DB_NAME, false);
 
@@ -25,20 +25,24 @@ export async function initDatabase() {
     }
 
     await db.open();
-
     await db.execute(SCHEMA_SQL);
 
-    console.log('Darts501 database initialised successfully');
+    console.log('[db] Database initialised successfully');
+    return db;
+}
+
+export function getDb() {
+    if (!db) throw new Error('Database not initialised. Call initDatabase() first.');
     return db;
 }
 
 export async function runQuery(sql, params = []) {
-    const database = await initDatabase();
+    const database = getDb();
     return await database.run(sql, params);
 }
 
 export async function selectQuery(sql, params = []) {
-    const database = await initDatabase();
+    const database = getDb();
     const result = await database.query(sql, params);
     return result.values || [];
 }
