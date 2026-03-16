@@ -1151,16 +1151,36 @@ const API = (() => {
     }
 
     async function killerThrow(matchId, data) {
+        // Killer manages state locally — no DB writes needed for throws
         return { ok: true, events: [] };
     }
 
     async function killerNext(matchId, data) {
         const playerRows = await _getSimplePlayers(matchId);
-        const currentIndex = data ? (data.current_player_index || 0) : 0;
-        const nextIndex = (currentIndex + 1) % playerRows.length;
-        return _buildSimpleState(matchId, matchId, playerRows, nextIndex, {
+        const currentIndex = (data && data.current_player_index !== undefined)
+            ? data.current_player_index : 0;
+
+        // Carry full player state (hits, is_killer, lives, eliminated, assigned_number) from data
+        const players = playerRows.map(function(p) {
+            const existing = (data && data.players)
+                ? data.players.find(function(dp) { return String(dp.id) === String(p.id); })
+                : null;
+            return Object.assign({}, p, existing || {
+                assigned_number: null, hits: 0, is_killer: false, lives: 3, eliminated: false
+            });
+        });
+
+        // Advance to next non-eliminated player
+        let nextIndex = (currentIndex + 1) % players.length;
+        let safety = 0;
+        while (players[nextIndex] && players[nextIndex].eliminated && safety < players.length) {
+            nextIndex = (nextIndex + 1) % players.length;
+            safety++;
+        }
+
+        return _buildSimpleState(matchId, matchId, players, nextIndex, {
             variant: data ? (data.variant || 'doubles') : 'doubles',
-            events:  [],
+            events:  (data && data.events) ? data.events : [],
         });
     }
 
