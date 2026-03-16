@@ -7,11 +7,14 @@
  *   NINE_LIVES_GAME.start(config, onEnd)
  *     config: { players: [{id, name}|{mode:'new', name}] }
  *     onEnd:  called when game ends or is abandoned
+ *
+ * MIGRATION NOTES:
+ *   - _onNext passes current_player_index and full player state to nineLivesNext
+ *   - nineLivesNext handles life deduction, target advance, and rotation locally
  */
 
 var NINE_LIVES_GAME = (function () {
 
-    // ── State ─────────────────────────────────────────────────────────────────
     var _state = {
         matchId:            null,
         gameId:             null,
@@ -27,16 +30,14 @@ var NINE_LIVES_GAME = (function () {
         cpuPlayerId:        null,
     };
 
-    // Buffered throws for current set (submitted on NEXT)
     var _pendingThrows  = [];
-    var _throwHistory   = [];   // for undo
-    var _hitThisTurn    = false;  // did current player hit their target this turn?
-    var _pendingWinner  = null;   // detected locally, confirmed on NEXT
+    var _throwHistory   = [];
+    var _hitThisTurn    = false;
+    var _pendingWinner  = null;
 
     // ── Public ────────────────────────────────────────────────────────────────
 
     function start(config, onEnd) {
-        // Full reset
         _state.matchId            = null;
         _state.gameId             = null;
         _state.players            = [];
@@ -48,8 +49,8 @@ var NINE_LIVES_GAME = (function () {
         _state.multiplier         = 1;
         _state.turnNumber         = 1;
         _state.setComplete        = false;
-        _state.cpuDifficulty  = 'medium';
-        _state.cpuTurnRunning = false;
+        _state.cpuDifficulty      = 'medium';
+        _state.cpuTurnRunning     = false;
         _pendingThrows  = [];
         _throwHistory   = [];
         _hitThisTurn    = false;
@@ -100,7 +101,6 @@ var NINE_LIVES_GAME = (function () {
     // ── Player resolution ─────────────────────────────────────────────────────
 
     function _resolvePlayers(selections) {
-        // Process sequentially to avoid race conditions
         var result = [];
         function resolveNext(i) {
             if (i >= selections.length) return Promise.resolve(result);
@@ -173,7 +173,6 @@ var NINE_LIVES_GAME = (function () {
         app.style.cssText = '';
         document.body.className = 'mode-nine-lives';
 
-        // ── Header ────────────────────────────────────────────────────────────
         var header = document.createElement('div');
         header.className = 'game-header';
 
@@ -236,31 +235,26 @@ var NINE_LIVES_GAME = (function () {
         header.appendChild(rightSlot);
         app.appendChild(header);
 
-        // ── Sidebar (left column) — player cards ──────────────────────────────
         var sidebar = document.createElement('aside');
         sidebar.id = 'nl-sidebar';
         sidebar.className = 'nl-sidebar';
         _renderBoard(sidebar);
         app.appendChild(sidebar);
 
-        // ── Board (right column) ──────────────────────────────────────────────
         var board = document.createElement('main');
         board.id = 'nl-seg-board';
         board.className = 'nl-seg-board';
 
-        // Status banner
         var statusEl = document.createElement('div');
         statusEl.id = 'nl-status';
         statusEl.className = 'nl-status-banner';
         board.appendChild(statusEl);
 
-        // Dart pills
         var pills = document.createElement('div');
         pills.id = 'nl-pills';
         pills.className = 'nl-pills';
         board.appendChild(pills);
 
-        // Multiplier tabs
         _state.multiplier = 1;
         var tabs = document.createElement('div');
         tabs.id = 'nl-tabs';
@@ -289,11 +283,9 @@ var NINE_LIVES_GAME = (function () {
         document.body.dataset.multiplier = 1;
         board.appendChild(tabs);
 
-        // Segment grid + bull row
         board.appendChild(_buildGrid());
         board.appendChild(_buildBullRow());
 
-        // Footer hint
         var footer = document.createElement('footer');
         footer.className = 'nl-footer';
         var footerMsg = document.createElement('span');
@@ -318,18 +310,15 @@ var NINE_LIVES_GAME = (function () {
                 (String(p.id) === String(_state.currentPlayerId) ? ' nl-active' : '') +
                 (p.eliminated ? ' nl-eliminated' : '');
 
-            // Name
             var nameEl = document.createElement('div');
             nameEl.className = 'nl-player-name';
             nameEl.textContent = p.name.toUpperCase();
 
-            // Target number — large display
             var targetEl = document.createElement('div');
             targetEl.id        = 'nl-target-' + p.id;
             targetEl.className = 'nl-player-target';
             targetEl.textContent = p.completed ? '✓' : p.target;
 
-            // Lives pips (9 total)
             var livesEl = document.createElement('div');
             livesEl.id        = 'nl-lives-' + p.id;
             livesEl.className = 'nl-lives';
@@ -348,10 +337,10 @@ var NINE_LIVES_GAME = (function () {
             var pip = document.createElement('span');
             if (i < lives) {
                 pip.className = 'nl-life-pip nl-life-pip-on';
-                pip.textContent = '\u{1F408}';  // 🐈 cat
+                pip.textContent = '\u{1F408}';
             } else {
                 pip.className = 'nl-life-pip';
-                pip.textContent = '\u26B0';     // ⚰ coffin
+                pip.textContent = '\u26B0';
             }
             container.appendChild(pip);
         }
@@ -372,11 +361,10 @@ var NINE_LIVES_GAME = (function () {
         });
     }
 
-    // Compute working state by replaying pending throws locally
     function _workingState() {
         var p = _currentPlayer();
         if (!p) return { target: 1, hit: false };
-        var target = p.target;  // never changes mid-turn
+        var target = p.target;
         var hit    = false;
         _pendingThrows.forEach(function (t) {
             if (t.segment === target) hit = true;
@@ -479,7 +467,6 @@ var NINE_LIVES_GAME = (function () {
 
         var p      = _currentPlayer();
         var ws     = _workingState();
-        // First dart to match the target scores the hit; further hits same number are neutral
         var isHit     = (!ws.hit && segment === ws.target && segment !== 0);
         var isNeutral = (ws.hit && segment === ws.target && segment !== 0);
 
@@ -490,21 +477,16 @@ var NINE_LIVES_GAME = (function () {
         _pendingThrows.push({ segment: segment, multiplier: multiplier, isHit: isHit });
         _throwHistory.push({ segment: segment, multiplier: multiplier, isHit: isHit });
 
-        // Sound
         if (typeof SOUNDS !== 'undefined' && SOUNDS.isEnabled()) {
             if (isHit) SOUNDS.dart();
         }
 
-        // Pill
         _addPill(segment, multiplier, isHit, isNeutral);
 
-        // Per-dart speech (just the number/label)
-        // CPU turns: speech is called by throwNext before _onThrow for correct timing
         if (!_state.cpuTurnRunning) {
             _speakDart(segment, multiplier, isHit);
         }
 
-        // Update working target display
         _updateBoardWorking();
         _updateStatus();
         _applyTargetHighlight();
@@ -512,7 +494,6 @@ var NINE_LIVES_GAME = (function () {
         var ub = document.getElementById('nl-undo-btn');
         if (ub) ub.disabled = false;
 
-        // Lock after 3 darts or after hitting target on final number (instant win)
         if (_pendingThrows.length >= 3 || _pendingWinner !== null) {
             _state.setComplete = true;
             _lockBoard(true);
@@ -537,11 +518,11 @@ var NINE_LIVES_GAME = (function () {
 
         submitPromise
             .then(function (s) {
-                if (s) _applyState(s);
+                // Do NOT _applyState here — nineLivesThrow returns { ok: true }
+                // which has no players array and would wipe _state.players
 
-                // Check server confirmed win
                 if (isWin || (s && s.status === 'complete')) {
-                    _state.status  = 'complete';
+                    _state.status   = 'complete';
                     _state.winnerId = _pendingWinner || (s && s.winner_id) || _state.winnerId;
                     UI.setLoading(false);
                     _pendingWinner = null;
@@ -551,8 +532,20 @@ var NINE_LIVES_GAME = (function () {
                     return;
                 }
 
-                // Pass hit result to /next so it can deduct life if missed
-                return API.nineLivesNext(_state.matchId, { hit_this_turn: hitThisTurn });
+                // Pass full local state so nineLivesNext can rotate and update lives correctly
+                return API.nineLivesNext(_state.matchId, {
+                    hit_this_turn:         hitThisTurn,
+                    current_player_index:  _state.currentPlayerIndex,
+                    players:               _state.players.map(function (p) {
+                        return {
+                            id:         p.id,
+                            target:     p.target     || 1,
+                            lives:      p.lives      !== undefined ? p.lives : 9,
+                            eliminated: p.eliminated || false,
+                            completed:  p.completed  || false,
+                        };
+                    }),
+                });
             })
             .then(function (s) {
                 if (!s) return;
@@ -560,13 +553,11 @@ var NINE_LIVES_GAME = (function () {
                 _applyState(s);
                 UI.setLoading(false);
 
-                // Process events
-                var events = s.events || [];
+                var events     = s.events || [];
                 var eliminated = events.filter(function (e) { return e.type === 'eliminated'; });
                 var lifeLost   = events.filter(function (e) { return e.type === 'life_lost'; });
+                var winEvent   = events.find(function (e)   { return e.type === 'winner'; });
 
-                // Check for winner declared by server (last survivor)
-                var winEvent = events.find(function (e) { return e.type === 'winner'; });
                 if (winEvent || s.status === 'complete') {
                     _state.status   = 'complete';
                     _state.winnerId = winEvent ? winEvent.player_id : s.winner_id;
@@ -578,7 +569,6 @@ var NINE_LIVES_GAME = (function () {
                 _updateBoard();
                 _applyTargetHighlight();
 
-                // Announce life lost / eliminations then next player
                 if (!hitThisTurn) {
                     _announceLifeLost(lifeLost, eliminated, function () {
                         var d = _announceCurrentPlayer(false);
@@ -612,7 +602,6 @@ var NINE_LIVES_GAME = (function () {
         var dartsThrown = 0;
 
         function throwNext() {
-            // Stop early if all 3 darts thrown or turn already complete
             if (dartsThrown >= 3 || _state.setComplete) {
                 _state.cpuTurnRunning = false;
                 _lockBoard(false);
@@ -641,16 +630,11 @@ var NINE_LIVES_GAME = (function () {
             return BOARD_RING[(idx + (Math.random() < 0.5 ? 1 : -1) + BOARD_RING.length) % BOARD_RING.length];
         }
 
-        // If already hit this turn, remaining darts are neutral — just throw singles
-        // CPU still aims at target (neutral hit) or misses; doesn't matter strategically
         if (alreadyHit) {
             return { segment: target, multiplier: 1 };
         }
 
-        // CPU intends to hit the target with some multiplier
         var r = Math.random();
-
-        // Decide intended multiplier based on difficulty
         var intendedMult;
         if (profile.preferTreble && r < 0.30) {
             intendedMult = 3;
@@ -660,57 +644,29 @@ var NINE_LIVES_GAME = (function () {
             intendedMult = 1;
         }
 
-        // Apply accuracy variance
         var acc = Math.random();
         if (acc < profile.hitRate) {
-            // Hit — lands on target with intended multiplier
             return { segment: target, multiplier: intendedMult };
         } else if (acc < profile.hitRate + profile.adjacentRate) {
-            // Near miss — adjacent segment, single
             return { segment: adjacentTo(target), multiplier: 1 };
         } else if (acc < profile.hitRate + profile.adjacentRate + profile.brainFadeRate) {
-            // Brain fade — random segment
             return { segment: BOARD_RING[Math.floor(Math.random() * BOARD_RING.length)], multiplier: 1 };
         } else {
-            // Complete miss
             return { segment: 0, multiplier: 0 };
         }
     }
 
     function _cpuNLProfile() {
         var profiles = {
-            // Easy: ~4% hit rate per dart → ~11% chance of hitting in a full turn of 3
-            // Overwhelmingly misses — adjacent landings, brain fades, complete misses
-            easy: {
-                preferTreble:  false,
-                doubleRate:    0.02,
-                hitRate:       0.04,
-                adjacentRate:  0.25,
-                brainFadeRate: 0.40,
-                // remainder (~0.31) = complete miss
-            },
-            // Medium: ~35% hit rate per dart → ~73% chance of hitting in a full turn
-            medium: {
-                preferTreble:  false,
-                doubleRate:    0.15,
-                hitRate:       0.35,
-                adjacentRate:  0.25,
-                brainFadeRate: 0.20,
-            },
-            // Hard: ~85% hit rate per dart — dangerous, occasionally aims trebles
-            hard: {
-                preferTreble:  true,
-                doubleRate:    0.30,
-                hitRate:       0.85,
-                adjacentRate:  0.10,
-                brainFadeRate: 0.03,
-            },
+            easy:   { preferTreble: false, doubleRate: 0.02, hitRate: 0.04, adjacentRate: 0.25, brainFadeRate: 0.40 },
+            medium: { preferTreble: false, doubleRate: 0.15, hitRate: 0.35, adjacentRate: 0.25, brainFadeRate: 0.20 },
+            hard:   { preferTreble: true,  doubleRate: 0.30, hitRate: 0.85, adjacentRate: 0.10, brainFadeRate: 0.03 },
         };
         return profiles[_state.cpuDifficulty] || profiles.medium;
     }
 
     function _clearTurn() {
-        _state.cpuDifficulty  = 'medium';
+        _state.cpuDifficulty  = _state.cpuDifficulty || 'medium';
         _state.cpuTurnRunning = false;
         _pendingThrows  = [];
         _throwHistory   = [];
@@ -727,7 +683,6 @@ var NINE_LIVES_GAME = (function () {
         if (ub) ub.disabled = true;
         _lockBoard(false);
 
-        // Reset multiplier to Single
         _state.multiplier = 1;
         var tabs = document.getElementById('nl-tabs');
         if (tabs) {
@@ -768,7 +723,7 @@ var NINE_LIVES_GAME = (function () {
         _applyTargetHighlight();
     }
 
-    // ── End ───────────────────────────────────────────────────────────────────
+    // ── End / Restart ─────────────────────────────────────────────────────────
 
     function _onRestart() {
         UI.showConfirmModal({
@@ -785,7 +740,6 @@ var NINE_LIVES_GAME = (function () {
         API.restartNineLivesMatch(_state.matchId)
             .then(function (state) {
                 _applyState(state);
-                _welcomedPlayers = {};
                 _buildScreen();
                 UI.showToast('MATCH RESTARTED', 'info', 2000);
                 var startDelay = _announceCurrentPlayer(true);
@@ -834,7 +788,6 @@ var NINE_LIVES_GAME = (function () {
             '<div class="setup-subtitle">NINE LIVES DARTS</div>' +
             '</div>';
 
-        // Final standings
         var table = document.createElement('div');
         table.className = 'nl-result-table';
 
@@ -897,7 +850,6 @@ var NINE_LIVES_GAME = (function () {
     function _speak(text, delay) {
         if (!SPEECH.isEnabled()) return;
         setTimeout(function () {
-            window.speechSynthesis && window.speechSynthesis.cancel();
             SPEECH.speak(text, { rate: 1.0, pitch: 1.0 });
         }, delay || 200);
     }
@@ -910,8 +862,6 @@ var NINE_LIVES_GAME = (function () {
         var delay  = isFirst ? 600 : 400;
         var msg    = p.name + ', you are targeting ' + target + '.';
         _speak(msg, delay);
-        // Return total time before speech finishes so callers can wait
-        // 300ms TTS startup + 150ms/char for iOS speech rate
         return delay + 300 + msg.length * 150;
     }
 
@@ -922,10 +872,8 @@ var NINE_LIVES_GAME = (function () {
                        segment === 25  ? (multiplier === 2 ? 'Bulls Eye' : 'Outer bull') :
                        (mulLabel ? mulLabel + ' ' + segment : String(segment));
         setTimeout(function () {
-            window.speechSynthesis && window.speechSynthesis.cancel();
             SPEECH.speak(segLabel, { rate: 1.0, pitch: 1.0 });
         }, 200);
-        // Return estimated duration: 200ms delay + 300ms TTS startup + 150ms/char
         return 200 + 300 + segLabel.length * 150;
     }
 
@@ -945,10 +893,8 @@ var NINE_LIVES_GAME = (function () {
         }
         var msg = msgs.join(' ');
         setTimeout(function () {
-            window.speechSynthesis && window.speechSynthesis.cancel();
             SPEECH.speak(msg, { rate: 1.0, pitch: 1.0 });
         }, 300);
-        // 300ms delay + 300ms TTS startup + 150ms/char
         var lifeLostDuration = 300 + 300 + msg.length * 150;
         _announceEliminations(eliminatedEvents, callback, lifeLostDuration);
     }
@@ -968,7 +914,6 @@ var NINE_LIVES_GAME = (function () {
         }
         setTimeout(function () {
             if (SPEECH.isEnabled()) {
-                window.speechSynthesis && window.speechSynthesis.cancel();
                 SPEECH.speak(msgs.join(' '), { rate: 1.0, pitch: 1.0 });
             }
             if (callback) setTimeout(callback, 800 + msgs.join(' ').length * 60);

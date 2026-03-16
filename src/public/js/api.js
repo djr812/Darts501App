@@ -1047,6 +1047,7 @@ const API = (() => {
     }
 
     async function nineLivesThrow(matchId, data) {
+        // Nine Lives manages state locally — no DB writes needed for throws
         return { ok: true, events: [] };
     }
 
@@ -1054,17 +1055,60 @@ const API = (() => {
         const playerRows = await _getSimplePlayers(matchId);
         const currentIndex = (data && data.current_player_index !== undefined)
             ? data.current_player_index : 0;
-        const nextIndex = (currentIndex + 1) % playerRows.length;
-        // Merge server player list with any state passed in data.players
-        const playersWithState = playerRows.map(function(p) {
+        const hitThisTurn = data ? !!data.hit_this_turn : false;
+
+        // Carry player state forward from data.players
+        let players = playerRows.map(function(p) {
             const existing = (data && data.players)
                 ? data.players.find(function(dp) { return String(dp.id) === String(p.id); })
                 : null;
             return Object.assign({}, p, existing || { target: 1, lives: 9, eliminated: false, completed: false });
         });
-        return _buildSimpleState(matchId, matchId, playersWithState, nextIndex, {
-            events: (data && data.events) ? data.events : [],
-        });
+
+        const currentPlayer = players[currentIndex];
+        const events = [];
+
+        if (currentPlayer) {
+            if (!hitThisTurn) {
+                // Miss — deduct a life
+                currentPlayer.lives = Math.max(0, (currentPlayer.lives || 1) - 1);
+                if (currentPlayer.lives === 0) {
+                    currentPlayer.eliminated = true;
+                    events.push({ type: 'eliminated', player_id: currentPlayer.id });
+                } else {
+                    events.push({ type: 'life_lost', player_id: currentPlayer.id, lives_remaining: currentPlayer.lives });
+                }
+            } else {
+                // Hit — advance target
+                const newTarget = (currentPlayer.target || 1) + 1;
+                if (newTarget > 20) {
+                    currentPlayer.completed = true;
+                    currentPlayer.target    = 21;
+                    events.push({ type: 'winner', player_id: currentPlayer.id });
+                } else {
+                    currentPlayer.target = newTarget;
+                }
+            }
+        }
+
+        // Check if only one player left alive (last survivor wins)
+        const alivePlayers = players.filter(function(p) { return !p.eliminated; });
+        if (alivePlayers.length === 1 && players.length > 1) {
+            const survivor = alivePlayers[0];
+            if (!events.find(function(e) { return e.type === 'winner'; })) {
+                events.push({ type: 'winner', player_id: survivor.id });
+            }
+        }
+
+        // Advance to next non-eliminated player
+        let nextIndex = (currentIndex + 1) % players.length;
+        let safety = 0;
+        while (players[nextIndex] && players[nextIndex].eliminated && safety < players.length) {
+            nextIndex = (nextIndex + 1) % players.length;
+            safety++;
+        }
+
+        return _buildSimpleState(matchId, matchId, players, nextIndex, { events });
     }
 
     async function restartNineLivesMatch(matchId) {
@@ -1143,24 +1187,40 @@ const API = (() => {
     }
 
     async function bermudaThrow(matchId, data) {
+        // Bermuda manages scoring locally — no DB writes needed for throws
         return { ok: true };
     }
 
     async function bermudaNext(matchId, data) {
         const playerRows = await _getSimplePlayers(matchId);
-        const currentIndex = data ? (data.current_player_index || 0) : 0;
+        const currentIndex = (data && data.current_player_index !== undefined)
+            ? data.current_player_index : 0;
         const nextIndex = (currentIndex + 1) % playerRows.length;
-        const playersWithScore = playerRows.map((p, i) => ({
-            ...p,
-            score: (data && data.player_scores && data.player_scores[i]) || 0,
-        }));
+
+        // Build events array — carry halved/scored events from data
+        const events = (data && data.events) ? data.events : [];
+
+        // Carry scores forward from data.players
+        const playersWithScore = playerRows.map(function(p) {
+            const existing = (data && data.players)
+                ? data.players.find(function(dp) { return String(dp.id) === String(p.id); })
+                : null;
+            return Object.assign({}, p, { score: existing ? (existing.score || 0) : 0 });
+        });
+
+        // Advance round when all players have thrown
+        let nextRound = (data && data.current_round) ? data.current_round : 1;
+        if (data && data.round_complete) {
+            nextRound = Math.min(nextRound + 1, 13);
+        }
+
         return _buildSimpleState(matchId, null, playersWithScore, nextIndex, {
-            current_round: data ? (data.current_round || 1) : 1,
-            events:        [],
+            current_round: nextRound,
+            events:        events,
         });
     }
 
-    async function restartBermudaMatch(matchId) {
+        async function restartBermudaMatch(matchId) {
         const players = await _getSimplePlayers(matchId);
         return createBermudaMatch({ player_ids: players.map(p => p.id) });
     }

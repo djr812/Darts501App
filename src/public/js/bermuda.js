@@ -7,13 +7,17 @@
  *   BERMUDA_GAME.start(config, onEnd)
  *     config: { players: [{id,name}|{mode:'new',name}] }
  *     onEnd:  called when game ends or is abandoned
+ *
+ * MIGRATION NOTES:
+ *   - _onThrow updates score display immediately on each dart
+ *   - _onNext passes current scores and halving state to bermudaNext
+ *   - Halving mechanic handled locally before API call
  */
 
 var BERMUDA_GAME = (function () {
 
-    // ── Round definitions (mirrors backend) ───────────────────────────────────
     var ROUNDS = [
-        null,                                                     // 1-based index padding
+        null,
         { type: 'number',  value: 12,           label: '12' },
         { type: 'number',  value: 13,           label: '13' },
         { type: 'number',  value: 14,           label: '14' },
@@ -29,7 +33,6 @@ var BERMUDA_GAME = (function () {
         { type: 'special', value: 'double_bull',label: 'Double Bull' },
     ];
 
-    // ── State ─────────────────────────────────────────────────────────────────
     var _state = {
         matchId:            null,
         players:            [],
@@ -47,9 +50,11 @@ var BERMUDA_GAME = (function () {
         cpuPlayerId:        null,
     };
 
-    var _pendingThrows = [];   // { segment, multiplier, points }
-    var _throwHistory  = [];   // for undo
+    var _pendingThrows = [];
+    var _throwHistory  = [];
     var _lastDartSpeechDur = 0;
+    // Track how many players have thrown this round
+    var _throwsThisRound = 0;
 
     // ── Public ────────────────────────────────────────────────────────────────
 
@@ -65,11 +70,12 @@ var BERMUDA_GAME = (function () {
         _state.onEnd              = null;
         _state.multiplier         = 1;
         _state.setComplete        = false;
-        _state.cpuDifficulty  = 'medium';
-        _state.cpuTurnRunning = false;
-        _state.cpuPlayerId    = null;
-        _pendingThrows = [];
-        _throwHistory  = [];
+        _state.cpuDifficulty      = 'medium';
+        _state.cpuTurnRunning     = false;
+        _state.cpuPlayerId        = null;
+        _pendingThrows     = [];
+        _throwHistory      = [];
+        _throwsThisRound   = 0;
 
         SPEECH.unlock();
         if (typeof SOUNDS !== 'undefined') SOUNDS.unlock();
@@ -174,7 +180,7 @@ var BERMUDA_GAME = (function () {
         return ROUNDS[_state.currentRound] || ROUNDS[1];
     }
 
-    // ── Score dart locally (mirrors backend) ──────────────────────────────────
+    // ── Scoring ───────────────────────────────────────────────────────────────
 
     function _scoreDart(segment, multiplier, roundNum) {
         var r = ROUNDS[roundNum];
@@ -214,7 +220,6 @@ var BERMUDA_GAME = (function () {
         app.style.cssText = '';
         document.body.className = 'mode-bermuda';
 
-        // ── Header ────────────────────────────────────────────────────────────
         var header = document.createElement('div');
         header.className = 'game-header';
 
@@ -278,38 +283,32 @@ var BERMUDA_GAME = (function () {
         header.appendChild(rightSlot);
         app.appendChild(header);
 
-        // ── Sidebar — player cards ─────────────────────────────────────────────
         var sidebar = document.createElement('aside');
         sidebar.id = 'bm-sidebar';
         sidebar.className = 'bm-sidebar';
         _renderBoard(sidebar);
         app.appendChild(sidebar);
 
-        // ── Board (right column) ──────────────────────────────────────────────
         var board = document.createElement('main');
         board.id = 'bm-seg-board';
         board.className = 'bm-seg-board';
 
-        // Status banner
         var statusEl = document.createElement('div');
         statusEl.id = 'bm-status';
         statusEl.className = 'bm-status-banner';
         board.appendChild(statusEl);
 
-        // Round progress strip
         var strip = document.createElement('div');
         strip.id = 'bm-round-strip';
         strip.className = 'bm-round-strip';
         board.appendChild(strip);
         _renderRoundStrip(strip);
 
-        // Dart pills
         var pills = document.createElement('div');
         pills.id = 'bm-pills';
         pills.className = 'bm-pills';
         board.appendChild(pills);
 
-        // Multiplier tabs
         _state.multiplier = 1;
         var tabs = document.createElement('div');
         tabs.id = 'bm-tabs';
@@ -338,11 +337,9 @@ var BERMUDA_GAME = (function () {
         document.body.dataset.multiplier = 1;
         board.appendChild(tabs);
 
-        // Segment grid + bull row
         board.appendChild(_buildGrid());
         board.appendChild(_buildBullRow());
 
-        // Footer hint
         var footer = document.createElement('footer');
         footer.className = 'bm-footer';
         var footerMsg = document.createElement('span');
@@ -355,8 +352,6 @@ var BERMUDA_GAME = (function () {
         _updateStatus();
         _applyHighlights();
     }
-
-    // ── Round progress strip ──────────────────────────────────────────────────
 
     function _renderRoundStrip(container) {
         container.innerHTML = '';
@@ -387,7 +382,7 @@ var BERMUDA_GAME = (function () {
             var scoreEl = document.createElement('div');
             scoreEl.id        = 'bm-score-' + p.id;
             scoreEl.className = 'bm-player-score';
-            scoreEl.textContent = p.score;
+            scoreEl.textContent = p.score || 0;
 
             var subEl = document.createElement('div');
             subEl.id        = 'bm-sub-' + p.id;
@@ -409,13 +404,20 @@ var BERMUDA_GAME = (function () {
                     (String(p.id) === String(_state.currentPlayerId) ? ' bm-active' : '');
             }
             var scoreEl = document.getElementById('bm-score-' + p.id);
-            if (scoreEl) scoreEl.textContent = p.score;
+            if (scoreEl) scoreEl.textContent = p.score || 0;
         });
     }
 
+    // Update the current player's score display immediately during a turn
+    function _updateCurrentPlayerScore() {
+        var cp = _currentPlayer();
+        if (!cp) return;
+        var running = (cp.score || 0) + _turnTotal();
+        var scoreEl = document.getElementById('bm-score-' + cp.id);
+        if (scoreEl) scoreEl.textContent = running;
+    }
+
     function _updateTurnSub() {
-        // Show running turn total for current player only
-        var p   = _currentPlayer();
         var tot = _turnTotal();
         _state.players.forEach(function (pl) {
             var subEl = document.getElementById('bm-sub-' + pl.id);
@@ -496,16 +498,13 @@ var BERMUDA_GAME = (function () {
                 btn.classList.add('bm-triple-highlight');
             }
         });
-        // Bull buttons
-        ['#bm-seg-board .bull-btn'].forEach(function (sel) {
-            document.querySelectorAll(sel).forEach(function (btn) {
-                btn.classList.remove('target-highlight');
-                if (ri.value === 'single_bull' && btn.textContent === 'OUTER') {
-                    btn.classList.add('target-highlight');
-                } else if (ri.value === 'double_bull' && btn.textContent === 'BULL') {
-                    btn.classList.add('target-highlight');
-                }
-            });
+        document.querySelectorAll('#bm-seg-board .bull-btn').forEach(function (btn) {
+            btn.classList.remove('target-highlight');
+            if (ri.value === 'single_bull' && btn.textContent === 'OUTER') {
+                btn.classList.add('target-highlight');
+            } else if (ri.value === 'double_bull' && btn.textContent === 'BULL') {
+                btn.classList.add('target-highlight');
+            }
         });
     }
 
@@ -532,7 +531,10 @@ var BERMUDA_GAME = (function () {
 
         _addPill(segment, multiplier, pts);
         var dartDuration = _speakDart(segment, multiplier, pts);
+
+        // Update sub label and score card immediately
         _updateTurnSub();
+        _updateCurrentPlayerScore();
 
         var ub = document.getElementById('bm-undo-btn');
         if (ub) ub.disabled = false;
@@ -542,7 +544,6 @@ var BERMUDA_GAME = (function () {
             _lockBoard(true);
             var nb = document.getElementById('bm-next-btn');
             if (nb) nb.disabled = false;
-            // CPU turn: throwNext handles _speakTurnTotal to avoid double-firing
             if (!_state.cpuTurnRunning) {
                 _speakTurnTotal(dartDuration);
             }
@@ -553,8 +554,50 @@ var BERMUDA_GAME = (function () {
 
     function _onNext() {
         UI.setLoading(true);
-        var throws  = _pendingThrows.slice();
+        var throws   = _pendingThrows.slice();
         var roundNum = _state.currentRound;
+        var cp       = _currentPlayer();
+
+        // Calculate what this turn did locally
+        var turnTotal  = throws.reduce(function (sum, t) { return sum + t.points; }, 0);
+        var didScore   = turnTotal > 0;
+        var currentScore = cp ? (cp.score || 0) : 0;
+
+        // Apply turn result locally to determine new score
+        var newScore;
+        var events = [];
+        if (didScore) {
+            newScore = currentScore + turnTotal;
+            events.push({ type: 'scored', player_id: cp ? cp.id : null, turn_points: turnTotal, new_score: newScore });
+        } else {
+            // Miss — halve the score
+            newScore = Math.floor(currentScore / 2);
+            if (cp) {
+                events.push({ type: 'halved', player_id: cp.id, new_score: newScore });
+                // Update local state immediately so _speakHalved has right value
+                cp.score = newScore;
+                var scoreEl = document.getElementById('bm-score-' + cp.id);
+                if (scoreEl) scoreEl.textContent = newScore;
+            }
+        }
+
+        // Update current player score in local state
+        if (cp) cp.score = newScore;
+
+        // Determine if round is complete (all players have thrown)
+        _throwsThisRound++;
+        var roundComplete = _throwsThisRound >= _state.players.length;
+        if (roundComplete) _throwsThisRound = 0;
+
+        // Check if game is over (round 13 complete)
+        var gameOver = roundComplete && _state.currentRound >= 13;
+        if (gameOver) {
+            // Find winner(s) — highest score
+            var maxScore = Math.max.apply(null, _state.players.map(function(p) { return p.score || 0; }));
+            var winners  = _state.players.filter(function(p) { return (p.score || 0) === maxScore; });
+            events.push({ type: 'game_over', winners: winners.map(function(p) { return p.id; }) });
+            _state.winnerIds = winners.map(function(p) { return p.id; });
+        }
 
         var submitPromise = throws.length > 0
             ? API.bermudaThrow(_state.matchId, { throws: throws, round_number: roundNum })
@@ -562,10 +605,17 @@ var BERMUDA_GAME = (function () {
 
         submitPromise
             .then(function () {
-                return API.bermudaNext(_state.matchId);
+                return API.bermudaNext(_state.matchId, {
+                    current_player_index: _state.currentPlayerIndex,
+                    current_round:        roundNum,
+                    round_complete:       roundComplete,
+                    players:              _state.players.map(function(p) {
+                        return { id: p.id, score: p.score || 0 };
+                    }),
+                    events:               events,
+                });
             })
             .then(function (s) {
-                var events = s.events || [];
                 _applyState(s);
                 UI.setLoading(false);
                 _clearTurn();
@@ -576,13 +626,10 @@ var BERMUDA_GAME = (function () {
                 if (roundStrip) _renderRoundStrip(roundStrip);
                 _applyHighlights();
 
-                // Process events — speech chain then next player announce
                 var halvedEv = events.find(function (e) { return e.type === 'halved'; });
-                var scoredEv = events.find(function (e) { return e.type === 'scored'; });
                 var overEv   = events.find(function (e) { return e.type === 'game_over'; });
 
                 if (overEv) {
-                    _state.winnerIds = overEv.winners || [];
                     var delay = 400;
                     if (halvedEv) {
                         delay = _speakHalved(halvedEv, true);
@@ -628,20 +675,17 @@ var BERMUDA_GAME = (function () {
             if (dartsThrown >= 3) {
                 _state.cpuTurnRunning = false;
                 _lockBoard(false);
-                // Wait for last dart speech + turn total speech before _onNext
                 var lastSpeechDur = _speakTurnTotal(_lastDartSpeechDur || 0);
                 setTimeout(_onNext, Math.max(1800, lastSpeechDur + 600));
                 return;
             }
             var dart = _cpuBMChooseDart(_state.currentRound);
             dartsThrown++;
-            // Speak dart label before _onThrow so guard inside _speakDart fires correctly
             var mulLabel = dart.multiplier === 3 ? 'Treble' : dart.multiplier === 2 ? 'Double' : '';
             var segLabel = dart.segment === 0  ? 'Miss' :
                            dart.segment === 25 ? (dart.multiplier === 2 ? 'Bulls Eye' : 'Outer bull') :
                            (mulLabel ? mulLabel + ' ' + dart.segment : String(dart.segment));
             setTimeout(function () {
-                window.speechSynthesis && window.speechSynthesis.cancel();
                 SPEECH.speak(segLabel, { rate: 1.0, pitch: 1.0 });
             }, 200);
             _lastDartSpeechDur = 200 + 300 + segLabel.length * 150;
@@ -670,7 +714,6 @@ var BERMUDA_GAME = (function () {
 
         if (round.type === 'number') {
             if (r < profile.numberHit) {
-                // Hit — aim for treble (hard) or single (easy/medium)
                 var mult = (profile.preferTreble && Math.random() < 0.5) ? 3 : 1;
                 return { segment: round.value, multiplier: mult };
             } else if (r < profile.numberHit + 0.20) {
@@ -679,81 +722,34 @@ var BERMUDA_GAME = (function () {
                 return { segment: 0, multiplier: 0 };
             }
         }
-
         if (round.value === 'any_double') {
-            if (r < profile.doubleHit) {
-                // Aim for D20 (highest scoring double)
-                return { segment: 20, multiplier: 2 };
-            } else if (r < profile.doubleHit + 0.15) {
-                return { segment: 20, multiplier: 1 };  // single — scores nothing but not a miss
-            } else {
-                return { segment: 0, multiplier: 0 };
-            }
+            if (r < profile.doubleHit) return { segment: 20, multiplier: 2 };
+            if (r < profile.doubleHit + 0.15) return { segment: 20, multiplier: 1 };
+            return { segment: 0, multiplier: 0 };
         }
-
         if (round.value === 'any_triple') {
-            if (r < profile.tripleHit) {
-                // Aim for T20
-                return { segment: 20, multiplier: 3 };
-            } else if (r < profile.tripleHit + 0.20) {
-                return { segment: 20, multiplier: 1 };
-            } else {
-                return { segment: 0, multiplier: 0 };
-            }
+            if (r < profile.tripleHit) return { segment: 20, multiplier: 3 };
+            if (r < profile.tripleHit + 0.20) return { segment: 20, multiplier: 1 };
+            return { segment: 0, multiplier: 0 };
         }
-
         if (round.value === 'single_bull') {
-            if (r < profile.bullHit) {
-                return { segment: 25, multiplier: 1 };   // outer bull = 25pts
-            } else if (r < profile.bullHit + 0.15) {
-                return { segment: 25, multiplier: 2 };   // inner bull — also scores for single_bull? no — but non-zero attempt
-            } else {
-                return { segment: 0, multiplier: 0 };
-            }
+            if (r < profile.bullHit) return { segment: 25, multiplier: 1 };
+            if (r < profile.bullHit + 0.15) return { segment: 25, multiplier: 2 };
+            return { segment: 0, multiplier: 0 };
         }
-
         if (round.value === 'double_bull') {
-            if (r < profile.dblBullHit) {
-                return { segment: 25, multiplier: 2 };   // inner bull = 50pts
-            } else if (r < profile.dblBullHit + 0.10) {
-                return { segment: 25, multiplier: 1 };   // outer bull — scores 0 for double_bull but not a miss of 3
-            } else {
-                return { segment: 0, multiplier: 0 };
-            }
+            if (r < profile.dblBullHit) return { segment: 25, multiplier: 2 };
+            if (r < profile.dblBullHit + 0.10) return { segment: 25, multiplier: 1 };
+            return { segment: 0, multiplier: 0 };
         }
-
         return { segment: 0, multiplier: 0 };
     }
 
     function _cpuBMProfile() {
         var profiles = {
-            // Easy: ~20% hit rate per dart on number rounds, lower on specials
-            easy: {
-                preferTreble: false,
-                numberHit:    0.20,   // ~20% chance per dart on number segments
-                doubleHit:    0.10,   // any double round
-                tripleHit:    0.08,   // any triple round
-                bullHit:      0.12,   // single bull round
-                dblBullHit:   0.08,   // double bull round
-            },
-            // Medium: ~50% on numbers, moderate on specials
-            medium: {
-                preferTreble: false,
-                numberHit:    0.50,
-                doubleHit:    0.30,
-                tripleHit:    0.25,
-                bullHit:      0.35,
-                dblBullHit:   0.20,
-            },
-            // Hard: ~85% on numbers, strong on specials
-            hard: {
-                preferTreble: true,
-                numberHit:    0.85,
-                doubleHit:    0.65,
-                tripleHit:    0.55,
-                bullHit:      0.70,
-                dblBullHit:   0.50,
-            },
+            easy:   { preferTreble: false, numberHit: 0.20, doubleHit: 0.10, tripleHit: 0.08, bullHit: 0.12, dblBullHit: 0.08 },
+            medium: { preferTreble: false, numberHit: 0.50, doubleHit: 0.30, tripleHit: 0.25, bullHit: 0.35, dblBullHit: 0.20 },
+            hard:   { preferTreble: true,  numberHit: 0.85, doubleHit: 0.65, tripleHit: 0.55, bullHit: 0.70, dblBullHit: 0.50 },
         };
         return profiles[_state.cpuDifficulty] || profiles.medium;
     }
@@ -771,7 +767,6 @@ var BERMUDA_GAME = (function () {
         if (ub) ub.disabled = true;
         _lockBoard(false);
 
-        // Reset multiplier to Single
         _state.multiplier = 1;
         var tabs = document.getElementById('bm-tabs');
         if (tabs) {
@@ -783,7 +778,6 @@ var BERMUDA_GAME = (function () {
         }
         document.body.dataset.multiplier = 1;
 
-        // Clear turn sub for all players
         _state.players.forEach(function (p) {
             var subEl = document.getElementById('bm-sub-' + p.id);
             if (subEl) { subEl.textContent = ''; subEl.className = 'bm-player-sub'; }
@@ -813,9 +807,10 @@ var BERMUDA_GAME = (function () {
         if (ub) ub.disabled = (_throwHistory.length === 0);
 
         _updateTurnSub();
+        _updateCurrentPlayerScore();
     }
 
-    // ── End ───────────────────────────────────────────────────────────────────
+    // ── End / Restart ─────────────────────────────────────────────────────────
 
     function _onRestart() {
         UI.showConfirmModal({
@@ -829,6 +824,7 @@ var BERMUDA_GAME = (function () {
 
     function _doRestart() {
         UI.setLoading(true);
+        _throwsThisRound = 0;
         API.restartBermudaMatch(_state.matchId)
             .then(function (state) {
                 _applyState(state);
@@ -886,7 +882,6 @@ var BERMUDA_GAME = (function () {
             '<div class="setup-subtitle">BERMUDA TRIANGLE · 13 ROUNDS</div>' +
             '</div>';
 
-        // Standings table
         var table = document.createElement('div');
         table.className = 'bm-result-table';
 
@@ -899,14 +894,13 @@ var BERMUDA_GAME = (function () {
 
         var sorted = _state.players.slice().sort(function (a, b) { return b.score - a.score; });
         sorted.forEach(function (p) {
-            var isWinner = winnerIds.indexOf(p.id) !== -1 ||
-                           winnerIds.indexOf(String(p.id)) !== -1;
+            var isWinner = winnerIds.indexOf(p.id) !== -1 || winnerIds.indexOf(String(p.id)) !== -1;
             var row = document.createElement('div');
             row.className = 'bm-result-row' + (isWinner ? ' bm-result-winner' : '');
             row.innerHTML =
                 '<span class="bm-result-name">' + _esc(p.name.toUpperCase()) +
                 (isWinner ? (isTie ? ' 🤝' : ' 🏆') : '') + '</span>' +
-                '<span class="bm-result-score">' + p.score + '</span>';
+                '<span class="bm-result-score">' + (p.score || 0) + '</span>';
             table.appendChild(row);
         });
         inner.appendChild(table);
@@ -939,7 +933,6 @@ var BERMUDA_GAME = (function () {
     function _speak(text, delay) {
         if (!SPEECH.isEnabled()) return;
         setTimeout(function () {
-            window.speechSynthesis && window.speechSynthesis.cancel();
             SPEECH.speak(text, { rate: 1.0, pitch: 1.0 });
         }, delay || 0);
     }
@@ -951,20 +944,16 @@ var BERMUDA_GAME = (function () {
         }
         var line1 = 'Welcome to Bermuda Triangle darts.';
         var line2 = 'A game of Halve It!';
-        // Speak line1, short pause (450ms), then line2, longer pause (800ms), then callback
         setTimeout(function () {
-            window.speechSynthesis && window.speechSynthesis.cancel();
             SPEECH.speak(line1, { rate: 1.0, pitch: 1.0 });
         }, 600);
-        var line1Dur = 600 + 300 + line1.length * 150;  // delay + TTS startup + chars
+        var line1Dur = 600 + 300 + line1.length * 150;
         var pause1   = 450;
         setTimeout(function () {
-            window.speechSynthesis && window.speechSynthesis.cancel();
             SPEECH.speak(line2, { rate: 1.0, pitch: 1.0 });
         }, line1Dur + pause1);
         var line2Dur = line1Dur + pause1 + 300 + line2.length * 150;
-        var pause2   = 800;
-        if (callback) setTimeout(callback, line2Dur + pause2);
+        if (callback) setTimeout(callback, line2Dur + 800);
     }
 
     function _announceRoundAndPlayer(isFirst) {
@@ -974,7 +963,6 @@ var BERMUDA_GAME = (function () {
         var msg = 'The current target is ' + ri.label + '. ' + p.name + "'s turn to throw.";
         var delay = isFirst ? 700 : 500;
         _speak(msg, delay);
-        // 300ms TTS startup + 150ms/char for iOS speech rate
         return delay + 300 + msg.length * 150;
     }
 
@@ -984,41 +972,33 @@ var BERMUDA_GAME = (function () {
         var segLabel = segment === 0  ? 'Miss' :
                        segment === 25 ? (multiplier === 2 ? 'Bulls Eye' : 'Outer bull') :
                        (mulLabel ? mulLabel + ' ' + segment : String(segment));
-        // Only speak for human throws — CPU calls this directly before _onThrow
         if (!_state.cpuTurnRunning) {
             setTimeout(function () {
-                window.speechSynthesis && window.speechSynthesis.cancel();
                 SPEECH.speak(segLabel, { rate: 1.0, pitch: 1.0 });
             }, 200);
         }
-        // 200ms delay + 300ms TTS startup + 150ms/char
         return 200 + 300 + segLabel.length * 150;
     }
 
     function _speakTurnTotal(dartSpeechDuration) {
         if (!SPEECH.isEnabled()) return 0;
         var total = _turnTotal();
-        if (total === 0) return 0;  // halved/miss handled in _onNext after server confirms
+        if (total === 0) return 0;
         var msg = total + ' points this turn.';
         var delay = (dartSpeechDuration || 0) + 300;
         setTimeout(function () {
-            window.speechSynthesis && window.speechSynthesis.cancel();
             SPEECH.speak(msg, { rate: 1.0, pitch: 1.0 });
         }, delay);
-        // Return total estimated duration so CPU _onNext knows when speech ends
         return delay + 300 + msg.length * 150;
     }
 
-    // Announce halved score; returns ms delay to wait before chaining next speech
     function _speakHalved(ev, isFinal) {
         if (!SPEECH.isEnabled()) return 400;
         var p   = _playerById(ev.player_id);
         var msg = (p ? p.name : '') + ', your total score is halved. It is now ' + ev.new_score + '.';
         setTimeout(function () {
-            window.speechSynthesis && window.speechSynthesis.cancel();
             SPEECH.speak(msg, { rate: 1.0, pitch: 1.0 });
         }, 500);
-        // 500ms delay + 300ms TTS startup + 150ms/char
         return 500 + 300 + msg.length * 150;
     }
 
