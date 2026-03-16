@@ -7,6 +7,11 @@
  *   BASEBALL_GAME.start(config, onEnd)
  *     config: { players: [{id, name}] }
  *     onEnd:  called when game ends or is abandoned
+ *
+ * MIGRATION NOTES:
+ *   - Each player tracks their own inning independently (stays until 3 outs)
+ *   - _onNext computes next player's inning and game-over locally before API call
+ *   - baseballNext in api.js just rotates player index and echoes state back
  */
 
 var BASEBALL_GAME = (function () {
@@ -21,25 +26,23 @@ var BASEBALL_GAME = (function () {
         currentPlayerId:    null,
         innings:            {},   // { pid: { inningNum: { runs, outs, darts, complete } } }
         totalRuns:          {},   // { pid: total }
-        currentThrows:      [],   // throws in current set
+        currentThrows:      [],
         dartsInSet:         0,
         status:             'active',
         winnerIds:          null,
         highScoreResults:   null,
         onEnd:              null,
-        // Local UI state
-        setComplete:        false,  // board locked after 3rd dart in a set
-        inningComplete:     false,  // 3 outs reached — inning is over
-        inningEndSpeechDur: 0,      // estimated ms for inning-end speech (used by CPU)
-        // CPU
+        setComplete:        false,
+        inningComplete:     false,
+        inningEndSpeechDur: 0,
         cpuDifficulty:      'medium',
         cpuTurnRunning:     false,
         cpuPlayerId:        null,
     };
 
-    var _throwHistory  = []; // local undo stack (cleared on NEXT)
-    var _pendingThrows = []; // buffered throws for current set, submitted on NEXT
-    var _welcomedPlayers = {}; // { playerId: true } — tracks first-turn welcome
+    var _throwHistory    = [];
+    var _pendingThrows   = [];
+    var _welcomedPlayers = {};
 
     // ─────────────────────────────────────────────────────────────────
     // Public: start
@@ -59,7 +62,10 @@ var BASEBALL_GAME = (function () {
         _resolvePlayers(config.players)
             .then(function (players) {
                 _resolvedPlayers = players;
-                return API.createBaseballMatch({ player_ids: players.map(function (p) { return p.id; }), cpu_difficulty: _state.cpuPlayerId ? _state.cpuDifficulty : undefined });
+                return API.createBaseballMatch({
+                    player_ids:     players.map(function (p) { return p.id; }),
+                    cpu_difficulty: _state.cpuPlayerId ? _state.cpuDifficulty : undefined,
+                });
             })
             .then(function (state) {
                 _applyState(state);
@@ -117,24 +123,21 @@ var BASEBALL_GAME = (function () {
             var old = prev.find(function (o) { return String(o.id) === String(p.id); });
             return Object.assign({}, p, { isCpu: old ? !!old.isCpu : (p.name === 'CPU') });
         });
-        _state.startNumber        = s.start_number;
-        _state.currentInning      = s.current_inning;
-        _state.currentPlayerIndex = s.current_player_index;
+        _state.startNumber        = s.start_number        || 1;
+        _state.currentInning      = s.current_inning      || 1;
+        _state.currentPlayerIndex = s.current_player_index || 0;
         _state.currentPlayerId    = s.current_player_id ? String(s.current_player_id) : null;
-        _state.innings            = s.innings || {};
+        _state.innings            = s.innings    || {};
         _state.totalRuns          = s.total_runs || {};
         _state.currentThrows      = s.current_throws || [];
-        _state.dartsInSet         = s.darts_in_set || 0;
-        _state.status             = s.status || 'active';
+        _state.dartsInSet         = s.darts_in_set  || 0;
+        _state.status             = s.status    || 'active';
         _state.winnerIds          = s.winner_ids || null;
         _state.highScoreResults   = s.high_score_results || null;
-
-        // NOTE: setComplete / inningComplete are driven by _endSet and _onNext,
-        // not derived from server state, to avoid re-locking after NEXT is pressed.
     }
 
     function _currentInningData() {
-        var pid = String(_state.currentPlayerId);
+        var pid  = String(_state.currentPlayerId);
         var inns = _state.innings[pid];
         if (!inns) return null;
         return inns[_state.currentInning] || null;
@@ -165,7 +168,6 @@ var BASEBALL_GAME = (function () {
         app.style.cssText = '';
         document.body.className = 'mode-baseball';
 
-        // ── Header ───────────────────────────────────────────────────
         var header = document.createElement('div');
         header.className = 'game-header';
 
@@ -229,38 +231,30 @@ var BASEBALL_GAME = (function () {
         header.appendChild(rightSlot);
         app.appendChild(header);
 
-        // ── Sidebar (left column) ─────────────────────────────────────
         var sidebar = document.createElement('aside');
         sidebar.id = 'bbmp-sidebar';
         sidebar.className = 'bbmp-sidebar';
-
-        // Scoreboard table inside sidebar
         var scoreBoard = document.createElement('div');
         scoreBoard.id = 'bbmp-scoreboard';
         scoreBoard.className = 'bbmp-scoreboard';
         _renderScoreboard(scoreBoard);
         sidebar.appendChild(scoreBoard);
-
         app.appendChild(sidebar);
 
-        // ── Board (right column) ──────────────────────────────────────
         var board = document.createElement('main');
         board.id = 'bbmp-board';
         board.className = 'bbmp-board';
 
-        // Status banner
         var statusBar = document.createElement('div');
         statusBar.id = 'bbmp-status';
         statusBar.className = 'bbmp-status-banner';
         board.appendChild(statusBar);
 
-        // Dart pills
         var pills = document.createElement('div');
         pills.id = 'bbmp-pills';
         pills.className = 'bbmp-pills';
         board.appendChild(pills);
 
-        // Multiplier tabs
         _state.multiplier = 1;
         var tabs = document.createElement('div');
         tabs.id = 'bbmp-tabs';
@@ -290,11 +284,9 @@ var BASEBALL_GAME = (function () {
         document.body.dataset.multiplier = 1;
         board.appendChild(tabs);
 
-        // Segment grid + bull row
         board.appendChild(_buildGrid());
         board.appendChild(_buildBullRow());
 
-        // Footer hint
         var footer = document.createElement('footer');
         footer.className = 'bbmp-footer';
         var footerMsg = document.createElement('span');
@@ -380,7 +372,6 @@ var BASEBALL_GAME = (function () {
         var numInnings = 9;
         var startNum   = _state.startNumber;
 
-        // Header row: blank + inning numbers + total
         var headRow = document.createElement('div');
         headRow.className = 'bbmp-sb-row bbmp-sb-head';
         var nameCell = document.createElement('div');
@@ -398,7 +389,6 @@ var BASEBALL_GAME = (function () {
         headRow.appendChild(totHead);
         container.appendChild(headRow);
 
-        // One row per player
         _state.players.forEach(function (p) {
             var pid  = String(p.id);
             var row  = document.createElement('div');
@@ -422,6 +412,9 @@ var BASEBALL_GAME = (function () {
                 var innData = (_state.innings[pid] || {})[inn];
                 if (innData && innData.complete) {
                     cell.textContent = innData.runs;
+                } else if (innData && innData.darts > 0) {
+                    // Inning in progress — show runs accumulated so far
+                    cell.textContent = innData.runs;
                 } else if (isCurrentCell) {
                     var cur = _currentInningData();
                     cell.textContent = cur ? cur.runs : '·';
@@ -440,7 +433,6 @@ var BASEBALL_GAME = (function () {
             container.appendChild(row);
         });
 
-        // Outs indicators for current player
         var outsRow = document.createElement('div');
         outsRow.className = 'bbmp-outs-row';
         outsRow.id = 'bbmp-outs-row';
@@ -454,7 +446,7 @@ var BASEBALL_GAME = (function () {
         label.className = 'bbmp-outs-label';
         label.textContent = 'OUTS:';
         container.appendChild(label);
-        var inn = _currentInningData();
+        var inn  = _currentInningData();
         var outs = inn ? inn.outs : 0;
         for (var i = 0; i < 3; i++) {
             var pip = document.createElement('span');
@@ -464,14 +456,12 @@ var BASEBALL_GAME = (function () {
     }
 
     function _updateScoreboard() {
-        // Update active row highlight
         _state.players.forEach(function (p) {
             var pid = String(p.id);
             var row = document.getElementById('bbmp-row-' + pid);
             if (row) {
                 row.classList.toggle('bbmp-sb-active', pid === String(_state.currentPlayerId));
             }
-            // Update all inning cells for this player
             for (var inn = 1; inn <= 9; inn++) {
                 var cell = document.getElementById('bbmp-cell-' + pid + '-' + inn);
                 if (!cell) continue;
@@ -480,6 +470,9 @@ var BASEBALL_GAME = (function () {
                 cell.className = 'bbmp-sb-cell' + (isCurrentCell ? ' bbmp-sb-cell-current' : '');
                 var innData = (_state.innings[pid] || {})[inn];
                 if (innData && innData.complete) {
+                    cell.textContent = innData.runs;
+                } else if (innData && innData.darts > 0) {
+                    // Inning in progress — show runs accumulated so far
                     cell.textContent = innData.runs;
                 } else if (isCurrentCell) {
                     var cur = _currentInningData();
@@ -525,7 +518,6 @@ var BASEBALL_GAME = (function () {
 
     function _onThrow(segment, multiplier) {
         if (_state.setComplete || _state.status !== 'active') return;
-        // Enforce max 3 darts per set locally
         if (_pendingThrows.length >= 3) return;
 
         var target = _targetNumber();
@@ -533,15 +525,13 @@ var BASEBALL_GAME = (function () {
         var runs   = isHit ? multiplier : 0;
         var isOut  = !isHit;
 
-        // Buffer the throw
         _pendingThrows.push({ segment: segment, multiplier: multiplier, runs: runs, isOut: isOut });
         _throwHistory.push({ segment: segment, multiplier: multiplier, runs: runs, isOut: isOut });
 
-        // Update local display state
-        if (!_state.innings[String(_state.currentPlayerId)]) {
-            _state.innings[String(_state.currentPlayerId)] = {};
-        }
         var pid = String(_state.currentPlayerId);
+        if (!_state.innings[pid]) {
+            _state.innings[pid] = {};
+        }
         if (!_state.innings[pid][_state.currentInning]) {
             _state.innings[pid][_state.currentInning] = { runs: 0, outs: 0, darts: 0, complete: false };
         }
@@ -551,16 +541,22 @@ var BASEBALL_GAME = (function () {
         inn.darts += 1;
         _state.totalRuns[pid] = (_state.totalRuns[pid] || 0) + runs;
 
-        // Sound
         if (typeof SOUNDS !== 'undefined' && SOUNDS.isEnabled()) {
             isHit ? SOUNDS.dart() : (SOUNDS.bust && SOUNDS.bust());
         }
 
-        // Pill
         _addPill(segment, multiplier, runs, isHit);
-
-        // Speech
         _speakDart(isHit, runs);
+
+        // If this dart completed 3 outs, mark inning done and flip to next inning.
+        // The player still throws remaining darts but they count toward the new inning.
+        if (inn.outs >= 3 && !inn.complete) {
+            inn.complete = true;
+            var completedInning = _state.currentInning;
+            _state.currentInning = Math.min(_state.currentInning + 1, 9);
+            _state.inningEndSpeechDur = _speakInningEnd(inn, completedInning);
+            _applyTargetHighlight();
+        }
 
         _updateScoreboard();
         _updateStatus();
@@ -568,32 +564,42 @@ var BASEBALL_GAME = (function () {
         var undoBtn = document.getElementById('bbmp-undo-btn');
         if (undoBtn) undoBtn.disabled = false;
 
-        // After 3 darts — lock board, enable NEXT
         if (_pendingThrows.length >= 3) {
-            _endSet(inn);
+            _endSet(_currentInningData() || inn);
         }
     }
 
     function _endSet(inn) {
-        _state.setComplete   = true;
-        _state.inningComplete = inn && inn.outs >= 3;
+        _state.setComplete = true;
+
+        // Inning is complete if the PREVIOUS inning was completed mid-turn
+        // (inn.complete was set in _onThrow) OR if this final inn has 3 outs
+        var pid         = String(_state.currentPlayerId);
+        var prevInn     = _state.currentInning > 1
+            ? (_state.innings[pid] || {})[_state.currentInning - 1]
+            : null;
+        var justCompleted = prevInn && prevInn.complete;
+
+        _state.inningComplete = justCompleted || (inn && inn.outs >= 3);
 
         _lockBoard(true);
         var nb = document.getElementById('bbmp-next-btn');
         if (nb) nb.disabled = false;
 
-        if (_state.inningComplete) {
-            _state.inningEndSpeechDur = _speakInningEnd(inn);
+        // Only speak inning end here if it wasn't already spoken mid-turn
+        if (_state.inningComplete && !justCompleted) {
+            _state.inningEndSpeechDur = _speakInningEnd(inn, _state.currentInning);
             if (typeof SOUNDS !== 'undefined' && SOUNDS.isEnabled()) {
                 setTimeout(function () { SOUNDS.checkout && SOUNDS.checkout(); }, 300);
             }
-        } else {
-            // Announce outs remaining
+        } else if (!_state.inningComplete) {
             if (SPEECH.isEnabled()) {
-                var outsLeft = 3 - inn.outs;
-                setTimeout(function () {
-                    SPEECH.speak(outsLeft + (outsLeft === 1 ? ' out' : ' outs') + ' remaining.', { rate: 1.0, pitch: 1.0 });
-                }, 700);
+                var outsLeft = 3 - (inn ? inn.outs : 0);
+                if (outsLeft > 0) {
+                    setTimeout(function () {
+                        SPEECH.speak(outsLeft + (outsLeft === 1 ? ' out' : ' outs') + ' remaining.', { rate: 1.0, pitch: 1.0 });
+                    }, 700);
+                }
             }
         }
     }
@@ -605,27 +611,93 @@ var BASEBALL_GAME = (function () {
     function _onNext() {
         UI.setLoading(true);
         var inningComplete = _state.inningComplete;
-        var throwsToSubmit = _pendingThrows.slice(); // copy before clearing
+        var throwsToSubmit = _pendingThrows.slice();
 
-        // Submit buffered throws first, then advance
         var submitPromise = throwsToSubmit.length > 0
             ? API.recordBaseballThrow(_state.matchId, { throws: throwsToSubmit })
             : Promise.resolve(null);
 
         submitPromise
             .then(function () {
-                return API.baseballNext(_state.matchId, { inning_complete: inningComplete });
+                // If inning completed mid-turn, it was already marked complete in _onThrow.
+                // If it completed on the 3rd dart, mark it now.
+                var pid = String(_state.currentPlayerId);
+                if (inningComplete) {
+                    // Find the completed inning — it may be currentInning (if flipped mid-turn,
+                    // currentInning already advanced) or currentInning itself
+                    var completedInnNum = _state.currentInning;
+                    // If current inning has no outs it means we already flipped — use previous
+                    var curInnData = (_state.innings[pid] || {})[_state.currentInning];
+                    if (!curInnData || curInnData.outs < 3) {
+                        // Already flipped mid-turn — the completed one is currentInning - 1
+                        completedInnNum = _state.currentInning - 1;
+                    }
+                    if (_state.innings[pid] && _state.innings[pid][completedInnNum]) {
+                        _state.innings[pid][completedInnNum].complete = true;
+                    }
+                }
+
+                // Find next player's current inning (each player tracks independently)
+                var nextIndex   = (_state.currentPlayerIndex + 1) % _state.players.length;
+                var nextPid     = String(_state.players[nextIndex].id);
+                var nextInnings = _state.innings[nextPid] || {};
+
+                // Scan to find the first incomplete inning for the next player
+                var nextPlayerInning = 1;
+                for (var i = 1; i <= 9; i++) {
+                    if (nextInnings[i] && nextInnings[i].complete) {
+                        nextPlayerInning = i + 1;
+                    } else {
+                        nextPlayerInning = i;
+                        break;
+                    }
+                }
+                if (nextPlayerInning > 9) nextPlayerInning = 9;
+
+                // Game over when every player has completed all 9 innings
+                var gameOver = _state.players.every(function (p) {
+                    var pInns = _state.innings[String(p.id)] || {};
+                    for (var i = 1; i <= 9; i++) {
+                        if (!pInns[i] || !pInns[i].complete) return false;
+                    }
+                    return true;
+                });
+
+                var status    = gameOver ? 'complete' : 'active';
+                var winnerIds = null;
+                if (gameOver) {
+                    var maxRuns = Math.max.apply(null, _state.players.map(function (p) {
+                        return _state.totalRuns[String(p.id)] || 0;
+                    }));
+                    winnerIds = _state.players
+                        .filter(function (p) {
+                            return (_state.totalRuns[String(p.id)] || 0) === maxRuns;
+                        })
+                        .map(function (p) { return String(p.id); })
+                        .join(',');
+                }
+
+                return API.baseballNext(_state.matchId, {
+                    current_player_index: _state.currentPlayerIndex,
+                    next_inning:          nextPlayerInning,
+                    start_number:         _state.startNumber,
+                    innings:              _state.innings,
+                    total_runs:           _state.totalRuns,
+                    status:               status,
+                    winner_ids:           winnerIds,
+                    players:              _state.players.map(function (p) {
+                        return { id: p.id, name: p.name };
+                    }),
+                });
             })
             .then(function (s) {
                 _throwHistory  = [];
                 _pendingThrows = [];
                 _applyState(s);
-                // Must reset AFTER _applyState so it doesn't re-derive them
                 _state.setComplete    = false;
                 _state.inningComplete = false;
                 UI.setLoading(false);
 
-                // Clear pills & reset buttons
                 var pills = document.getElementById('bbmp-pills');
                 if (pills) pills.innerHTML = '';
                 var nb = document.getElementById('bbmp-next-btn');
@@ -634,7 +706,6 @@ var BASEBALL_GAME = (function () {
                 if (ub) ub.disabled = true;
                 _lockBoard(false);
 
-                // Reset multiplier tab to Single
                 _state.multiplier = 1;
                 var tabs = document.getElementById('bbmp-tabs');
                 if (tabs) {
@@ -677,7 +748,6 @@ var BASEBALL_GAME = (function () {
         var last = _throwHistory.pop();
         _pendingThrows.pop();
 
-        // Reverse the local state update
         var pid = String(_state.currentPlayerId);
         var inn = _state.innings[pid] && _state.innings[pid][_state.currentInning];
         if (inn) {
@@ -687,7 +757,6 @@ var BASEBALL_GAME = (function () {
         }
         _state.totalRuns[pid] = (_state.totalRuns[pid] || 0) - last.runs;
 
-        // If board was locked after 3rd dart, unlock it
         if (_state.setComplete) {
             _state.setComplete    = false;
             _state.inningComplete = false;
@@ -696,7 +765,6 @@ var BASEBALL_GAME = (function () {
             if (nb) nb.disabled = true;
         }
 
-        // Remove last pill
         var pills = document.getElementById('bbmp-pills');
         if (pills && pills.lastChild) pills.removeChild(pills.lastChild);
 
@@ -708,7 +776,7 @@ var BASEBALL_GAME = (function () {
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // End / abandon
+    // End / Restart
     // ─────────────────────────────────────────────────────────────────
 
     function _onRestart() {
@@ -749,14 +817,8 @@ var BASEBALL_GAME = (function () {
             onConfirm: function () {
                 UI.setLoading(true);
                 API.endBaseballMatch(_state.matchId)
-                    .then(function () {
-                        UI.setLoading(false);
-                        if (_state.onEnd) _state.onEnd();
-                    })
-                    .catch(function () {
-                        UI.setLoading(false);
-                        if (_state.onEnd) _state.onEnd();
-                    });
+                    .then(function () { UI.setLoading(false); if (_state.onEnd) _state.onEnd(); })
+                    .catch(function () { UI.setLoading(false); if (_state.onEnd) _state.onEnd(); });
             }
         });
     }
@@ -775,7 +837,9 @@ var BASEBALL_GAME = (function () {
             return winnerIds.indexOf(String(p.id)) !== -1;
         });
         var isTie     = winners.length > 1;
-        var titleText = isTie ? 'TIE GAME!' : (winners.length ? winners[0].name.toUpperCase() + ' WINS!' : 'GAME OVER');
+        var titleText = isTie
+            ? 'TIE GAME!'
+            : (winners.length ? winners[0].name.toUpperCase() + ' WINS!' : 'GAME OVER');
 
         var inner = document.createElement('div');
         inner.className = 'setup-screen-inner';
@@ -787,7 +851,6 @@ var BASEBALL_GAME = (function () {
             '<div class="setup-subtitle">BASEBALL DARTS — 9 INNINGS</div>' +
             '</div>';
 
-        // Full scorecard
         var scorecard = document.createElement('div');
         scorecard.className = 'bbmp-result-scorecard';
         var headRow = document.createElement('div');
@@ -800,9 +863,9 @@ var BASEBALL_GAME = (function () {
         scorecard.appendChild(headRow);
 
         _state.players.forEach(function (p) {
-            var pid    = String(p.id);
-            var isWin  = winnerIds.indexOf(pid) !== -1;
-            var pRow   = document.createElement('div');
+            var pid   = String(p.id);
+            var isWin = winnerIds.indexOf(pid) !== -1;
+            var pRow  = document.createElement('div');
             pRow.className = 'bbmp-result-row' + (isWin ? ' bbmp-result-winner' : '');
             pRow.innerHTML = '<span class="bbmp-result-name">' + _esc(p.name.toUpperCase()) + '</span>';
             var total = 0;
@@ -817,7 +880,6 @@ var BASEBALL_GAME = (function () {
         });
         inner.appendChild(scorecard);
 
-        // High score notifications
         if (s.high_score_results) {
             var hsWrap = document.createElement('div');
             hsWrap.className = 'bbmp-hs-wrap';
@@ -840,7 +902,6 @@ var BASEBALL_GAME = (function () {
         doneBtn.addEventListener('click', function () { if (_state.onEnd) _state.onEnd(); });
         inner.appendChild(doneBtn);
 
-        // Speech
         _speakResult(titleText, s.high_score_results);
     }
 
@@ -867,7 +928,7 @@ var BASEBALL_GAME = (function () {
         var pills = document.getElementById('bbmp-pills');
         if (!pills) return;
         var mulStr = multiplier === 3 ? 'T' : multiplier === 2 ? 'D' : segment === 0 ? '' : 'S';
-        var segStr = segment === 0 ? 'MISS' :
+        var segStr = segment === 0  ? 'MISS' :
                      segment === 25 ? (multiplier === 2 ? 'BULL' : 'OUTER') :
                      mulStr + segment;
         var pill = document.createElement('div');
@@ -885,7 +946,6 @@ var BASEBALL_GAME = (function () {
     function _speak(text, delay) {
         if (!SPEECH.isEnabled()) return;
         setTimeout(function () {
-            window.speechSynthesis && window.speechSynthesis.cancel();
             SPEECH.speak(text, { rate: 1.0, pitch: 1.0 });
         }, delay || 200);
     }
@@ -893,17 +953,17 @@ var BASEBALL_GAME = (function () {
     function _announceCurrentPlayer(isFirst) {
         var player = _currentPlayer();
         if (!player) return 0;
-        var pid    = String(player.id);
-        // If not explicitly told isFirst, derive it from whether we've welcomed them before
+        var pid = String(player.id);
         if (isFirst === undefined) {
             isFirst = !_welcomedPlayers[pid];
         }
         _welcomedPlayers[pid] = true;
         var target = _targetNumber();
         var msg = isFirst
-            ? player.name + ', welcome to Baseball Darts. In inning ' + _state.currentInning +
-              ' you are targeting number ' + target + '.'
-            : player.name + '. Inning ' + _state.currentInning + '. Target number ' + target + '.';
+            ? player.name + ', welcome to Baseball Darts. You are in inning number ' +
+              _state.currentInning + '. Your target segment is ' + target + '.'
+            : player.name + ', you are in inning number ' + _state.currentInning +
+              '. Your target segment is ' + target + '.';
         _speak(msg, 400);
         return 400 + 200 + msg.length * 120;
     }
@@ -918,7 +978,6 @@ var BASEBALL_GAME = (function () {
     }
 
     function _dartSpeechDuration(segment, multiplier) {
-        // Estimates full speech duration for a dart on the current target — used by CPU timing
         var target = _targetNumber();
         var isHit  = (segment === target);
         var runs   = isHit ? multiplier : 0;
@@ -928,16 +987,26 @@ var BASEBALL_GAME = (function () {
         return 300 + msg.length * 120;
     }
 
-    function _speakInningEnd(inn) {
+    function _speakInningEnd(inn, inningNum) {
         if (!SPEECH.isEnabled()) return 0;
         var player = _currentPlayer();
         var name   = player ? player.name : '';
         var runs   = inn ? inn.runs : 0;
-        var msg    = 'Inning ' + _state.currentInning + ' over for ' + name + '. ' +
+        var num    = inningNum !== undefined ? inningNum : _state.currentInning;
+        var msg    = 'Inning ' + num + ' over for ' + name + '. ' +
                      runs + (runs === 1 ? ' run' : ' runs') + ' this inning.';
         _speak(msg, 500);
-        // Return estimated ms until speech finishes (500ms delay + startup + per-char rate)
-        return 500 + 300 + msg.length * 150;
+        var endDur = 500 + 300 + msg.length * 150;
+
+        // If not the final inning, announce the new target
+        if (num < 9) {
+            var newTarget = _state.startNumber + num; // num is the completed inning, so next = num + 1 - 1 + startNumber
+            var newMsg = 'New inning. You are now targeting segment number ' + newTarget + '.';
+            _speak(newMsg, endDur + 300);
+            endDur = endDur + 300 + 300 + newMsg.length * 150;
+        }
+
+        return endDur;
     }
 
     function _speakResult(titleText, hsResults) {
@@ -974,7 +1043,6 @@ var BASEBALL_GAME = (function () {
         function _throwNext() {
             if (dartsThrown >= 3 || _state.setComplete) {
                 _state.cpuTurnRunning = false;
-                // If the inning just ended, wait for the "Inning over for..." speech to finish
                 var endDelay = _state.inningComplete
                     ? Math.max(1800, (_state.inningEndSpeechDur || 0) + 600)
                     : 700;
@@ -1010,20 +1078,16 @@ var BASEBALL_GAME = (function () {
         var r      = Math.random();
         var BOARD_RING = [20,1,18,4,13,6,10,15,2,17,3,19,7,16,8,11,14,9,12,5];
 
-        // All difficulties aim for the target number; accuracy determines whether they hit it
         if (diff === 'hard') {
-            // Hard: mostly trebles, some doubles, rare singles
             if (r < 0.55) return { segment: target, multiplier: 3 };
             if (r < 0.80) return { segment: target, multiplier: 2 };
             return { segment: target, multiplier: 1 };
         } else if (diff === 'medium') {
-            // Medium: mix of multipliers, some misses to adjacent
             if (r < 0.30) return { segment: target, multiplier: 3 };
             if (r < 0.58) return { segment: target, multiplier: 2 };
             if (r < 0.82) return { segment: target, multiplier: 1 };
             return { segment: BOARD_RING[Math.floor(Math.random() * BOARD_RING.length)], multiplier: 1 };
         } else {
-            // Easy: mainly singles, frequent misses to other segments
             if (r < 0.08) return { segment: target, multiplier: 3 };
             if (r < 0.20) return { segment: target, multiplier: 2 };
             if (r < 0.45) return { segment: target, multiplier: 1 };
@@ -1032,12 +1096,6 @@ var BASEBALL_GAME = (function () {
     }
 
     function _cpuProfile() {
-        // missChance: probability per dart of going completely off-target (= an out).
-        // This is checked FIRST in _cpuApplyVariance before any multiplier variance,
-        // guaranteeing that every difficulty level produces outs regularly.
-        //   easy:   ~55% chance of an out per dart  → usually 1-3 outs per inning
-        //   medium: ~30% chance of an out per dart  → usually 0-2 outs per inning
-        //   hard:   ~15% chance of an out per dart  → usually 0-1 outs per inning, occasionally 0
         var profiles = {
             easy:   { missChance: 0.55, trebleHit: 0.40, trebleSingle: 0.35, doubleHit: 0.50, doubleSingle: 0.30, singleHit: 0.75 },
             medium: { missChance: 0.30, trebleHit: 0.68, trebleSingle: 0.20, doubleHit: 0.65, doubleSingle: 0.20, singleHit: 0.88 },
@@ -1053,7 +1111,6 @@ var BASEBALL_GAME = (function () {
             if (idx === -1) return seg;
             return BOARD_RING[(idx + (Math.random() < 0.5 ? 1 : -1) + BOARD_RING.length) % BOARD_RING.length];
         }
-        // Apply guaranteed miss chance first — this ensures outs happen at all difficulty levels
         if (Math.random() < profile.missChance) {
             return { segment: adjacent(segment), multiplier: 1 };
         }

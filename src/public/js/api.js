@@ -1282,22 +1282,46 @@ const API = (() => {
     }
 
     async function recordBaseballThrow(matchId, data) {
+        // Baseball manages state locally — no DB writes needed for throws
         return { ok: true };
     }
 
     async function baseballNext(matchId, data) {
-        const playerRows = await _getSimplePlayers(matchId);
-        const currentIndex = data ? (data.current_player_index || 0) : 0;
-        const nextIndex = (currentIndex + 1) % playerRows.length;
-        return _buildSimpleState(matchId, matchId, playerRows, nextIndex, {
-            start_number:       data ? (data.start_number || 1) : 1,
-            current_inning:     data ? (data.current_inning || 1) : 1,
-            innings:            data ? (data.innings || {}) : {},
-            total_runs:         data ? (data.total_runs || {}) : {},
+        // Baseball tracks per-player innings independently.
+        // All state is managed locally in baseball.js — this function just
+        // rotates the player index and echoes the state back unchanged.
+        const playerRows  = await _getSimplePlayers(matchId);
+        const currentIndex = (data && data.current_player_index !== undefined)
+            ? data.current_player_index : 0;
+        const numPlayers  = playerRows.length;
+        const nextIndex   = (currentIndex + 1) % numPlayers;
+
+        const innings   = (data && data.innings)    ? data.innings    : {};
+        const totalRuns = (data && data.total_runs) ? data.total_runs : {};
+        const startNum  = (data && data.start_number)   ? data.start_number   : 1;
+
+        // next_inning and status are pre-computed in baseball.js and passed in
+        const nextInning = (data && data.next_inning)   ? data.next_inning   : 1;
+        const status     = (data && data.status)        ? data.status        : 'active';
+        const winnerIds  = (data && data.winner_ids)    ? data.winner_ids    : null;
+
+        const players = playerRows.map(function(p) {
+            const existing = (data && data.players)
+                ? data.players.find(function(dp) { return String(dp.id) === String(p.id); })
+                : null;
+            return Object.assign({}, p, existing || {});
+        });
+
+        return _buildSimpleState(matchId, matchId, players, nextIndex, {
+            start_number:       startNum,
+            current_inning:     nextInning,
+            innings:            innings,
+            total_runs:         totalRuns,
             current_throws:     [],
             darts_in_set:       0,
-            winner_ids:         data ? (data.winner_ids || null) : null,
+            winner_ids:         winnerIds,
             high_score_results: null,
+            status:             status,
         });
     }
 
