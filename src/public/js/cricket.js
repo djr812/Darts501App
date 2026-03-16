@@ -7,6 +7,11 @@
  *   CRICKET_GAME.start(config, onEnd)
  *     config: { players: [{id, name, isCpu}], ... }
  *     onEnd:  called when game ends or is abandoned
+ *
+ * MIGRATION NOTE:
+ *   _flushPendingTurn no longer calls _applyState on background flushes
+ *   (when onComplete is null). This prevents the server response from
+ *   resetting currentPlayerId back to player 1 after player rotation.
  */
 
 var CRICKET_GAME = (function () {
@@ -127,7 +132,7 @@ var CRICKET_GAME = (function () {
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // Player resolution (reuse pattern from practice.js)
+    // Player resolution
     // ─────────────────────────────────────────────────────────────────
 
     function _resolvePlayers(selections, difficulty) {
@@ -171,8 +176,6 @@ var CRICKET_GAME = (function () {
         _state.status          = s.status;
         _state.winnerId        = s.winner_id;
 
-        // Normalise all keys to strings so marks[pid][num] always works
-        // regardless of whether JSON gave us integer or string keys
         _state.marks  = {};
         _state.scores = {};
         Object.keys(s.marks).forEach(function(pid) {
@@ -184,7 +187,6 @@ var CRICKET_GAME = (function () {
         Object.keys(s.scores).forEach(function(pid) {
             _state.scores[String(pid)] = s.scores[pid];
         });
-        // Also normalise currentPlayerId to string
         _state.currentPlayerId = String(s.current_player_id);
     }
 
@@ -203,7 +205,6 @@ var CRICKET_GAME = (function () {
         app.style.cssText = '';
         document.body.className = 'mode-cricket';
 
-        // ── Header ────────────────────────────────────────────────────────────
         var header = document.createElement('div');
         header.id = 'cricket-header';
         header.className = 'cricket-header game-header';
@@ -268,32 +269,27 @@ var CRICKET_GAME = (function () {
         header.appendChild(rightSlot);
         app.appendChild(header);
 
-        // ── Sidebar — scoreboard ──────────────────────────────────────────────
         var sidebar = document.createElement('aside');
         sidebar.id = 'cricket-sidebar';
         sidebar.className = 'cricket-sidebar';
         _renderBoard(sidebar);
         app.appendChild(sidebar);
 
-        // ── Board (right column) ──────────────────────────────────────────────
         var segBoard = document.createElement('main');
         segBoard.id = 'cricket-seg-board';
         segBoard.className = 'cricket-seg-board';
 
-        // Status banner
         var statusEl = document.createElement('div');
         statusEl.id = 'cricket-status';
         statusEl.className = 'cricket-status-banner';
         _updateStatusBanner(statusEl);
         segBoard.appendChild(statusEl);
 
-        // Dart pills
         var pills = document.createElement('div');
         pills.id = 'cricket-pills';
         pills.className = 'cricket-pills';
         segBoard.appendChild(pills);
 
-        // Multiplier tabs
         _state.multiplier = 1;
         var tabs = document.createElement('div');
         tabs.id = 'cricket-tabs';
@@ -323,7 +319,6 @@ var CRICKET_GAME = (function () {
         document.body.dataset.multiplier = 1;
         segBoard.appendChild(tabs);
 
-        // Full segment grid (1–20)
         var grid = document.createElement('div');
         grid.id = 'cricket-seg-grid';
         grid.className = 'segment-grid';
@@ -343,7 +338,6 @@ var CRICKET_GAME = (function () {
         }
         segBoard.appendChild(grid);
 
-        // Bull row (MISS / OUTER / BULL)
         var bullRow = document.createElement('div');
         bullRow.className = 'bull-row';
         var missBtn = document.createElement('button');
@@ -375,7 +369,6 @@ var CRICKET_GAME = (function () {
         bullRow.appendChild(bullBtn);
         segBoard.appendChild(bullRow);
 
-        // Footer
         var footer = document.createElement('footer');
         footer.className = 'cricket-footer';
         footer.textContent = 'CRICKET NUMBERS: 15 · 16 · 17 · 18 · 19 · 20 · BULL';
@@ -390,10 +383,7 @@ var CRICKET_GAME = (function () {
 
     function _renderBoard(container) {
         container.innerHTML = '';
-        var nPlayers = _state.players.length;
 
-        // Build grid: col 0 = number label, col 1..n = player cols
-        // Header row: blank | player names + scores
         var headerRow = document.createElement('div');
         headerRow.className = 'cricket-row cricket-row-header';
 
@@ -422,7 +412,6 @@ var CRICKET_GAME = (function () {
         });
         container.appendChild(headerRow);
 
-        // Number rows
         NUMBERS.forEach(function (num) {
             var row = document.createElement('div');
             row.className = 'cricket-row';
@@ -436,11 +425,9 @@ var CRICKET_GAME = (function () {
             numLabel.textContent = NUMBER_LABELS[num] || num;
             numCell.appendChild(numLabel);
 
-            // Status badge: OPEN (someone can score), CLOSED (all players have 3 marks)
             var allClosed = _state.players.every(function(p) {
                 return (_state.marks[String(p.id)] && _state.marks[String(p.id)][String(num)] >= 3);
             });
-            // "Owned" = at least one player has closed it but not all
             var anyOpen = _state.players.some(function(p) {
                 return (_state.marks[String(p.id)] && _state.marks[String(p.id)][String(num)] >= 3);
             });
@@ -511,7 +498,6 @@ var CRICKET_GAME = (function () {
     }
 
     function _updateRowHighlights() {
-        // Highlight rows where at least one player can still score or close
         NUMBERS.forEach(function (num) {
             var row = document.getElementById('cricket-row-' + num);
             if (!row) return;
@@ -556,46 +542,35 @@ var CRICKET_GAME = (function () {
     // Throw
     // ─────────────────────────────────────────────────────────────────
 
-    // ─────────────────────────────────────────────────────────────────
-    // _throwDart — LOCAL only, no server call.
-    // Scores the dart instantly from JS state and buffers it in
-    // _state.pendingDarts. Server is only contacted on _flushPendingTurn().
-    // ─────────────────────────────────────────────────────────────────
     function _throwDart(segment, multiplier) {
         if (_state.turnComplete || _state.status !== 'active') return;
 
         if (multiplier === undefined) multiplier = _state.multiplier;
         if (segment === 0) multiplier = 0;
 
-        // Score locally
         var result = _LocalCricket.processThrow(
             segment, multiplier,
             _state.marks, _state.scores,
             _state.players, _state.currentPlayerId
         );
 
-        // Apply to local state immediately
         _state.marks  = result.newMarks;
         _state.scores = result.newScores;
         _state.dartsThisTurn++;
 
-        // Buffer dart for server flush
         _state.pendingDarts.push({ segment: segment, multiplier: multiplier });
 
-        // Update UI instantly
         var board = document.getElementById('cricket-sidebar');
         if (board) _renderBoard(board);
         _addPill(segment, multiplier, result.marksAdded, result.pointsScored);
         _updateStatusBanner();
 
-        // Sound
         if (typeof SOUNDS !== 'undefined' && SOUNDS.isEnabled()) {
             if (result.isWin) SOUNDS.checkout();
             else if (result.pointsScored > 0) SOUNDS.ton();
             else SOUNDS.dart();
         }
 
-        // Speech
         if (SPEECH.isEnabled()) {
             var speechPts = segment === 0 ? 0 : (result.pointsScored > 0 ? result.pointsScored : 1);
             setTimeout(function() {
@@ -603,7 +578,6 @@ var CRICKET_GAME = (function () {
             }, 300);
         }
 
-        // Win detected locally — flush immediately then show modal
         if (result.isWin) {
             _state.turnComplete = true;
             _lockBoard(true);
@@ -616,25 +590,31 @@ var CRICKET_GAME = (function () {
             return;
         }
 
-        // After 3 darts — show NEXT and flush
         if (_state.dartsThisTurn >= 3) {
             _state.turnComplete = true;
             var nextBtn = document.getElementById('cricket-next-btn');
             if (nextBtn) nextBtn.disabled = false;
             var undoBtn2 = document.getElementById('cricket-undo-btn');
             if (undoBtn2) undoBtn2.disabled = false;
-            // Flush to server in background while player reads board
+            // Flush to server in background — do NOT call _applyState on
+            // completion as it would reset currentPlayerId before _onNext
+            // has a chance to rotate to the next player.
             _flushPendingTurn(null);
             return;
         }
 
-        // More darts to throw
         var undoBtn = document.getElementById('cricket-undo-btn');
         if (undoBtn) undoBtn.disabled = false;
     }
 
-    // Send all buffered darts to the server sequentially.
-    // onComplete(serverState) called after last dart, or null on error.
+    // ─────────────────────────────────────────────────────────────────
+    // _flushPendingTurn
+    //
+    // KEY FIX: _applyState is ONLY called when onComplete is provided
+    // (i.e. for win detection). For background turn flushes (onComplete=null),
+    // we deliberately skip _applyState so the local player rotation set
+    // by _onNext → _advance is not overwritten by the server response.
+    // ─────────────────────────────────────────────────────────────────
     function _flushPendingTurn(onComplete) {
         if (_state.pendingDarts.length === 0) {
             if (onComplete) onComplete(null);
@@ -646,9 +626,13 @@ var CRICKET_GAME = (function () {
 
         function sendNext(i) {
             if (i >= darts.length) {
-                // Re-sync authoritative state from server
-                if (lastState) _applyState(lastState);
-                if (onComplete) onComplete(lastState);
+                // Only re-sync state from server when a callback is provided.
+                // Background flushes (onComplete=null) must NOT call _applyState
+                // or the player rotation will be reset to player 1.
+                if (onComplete) {
+                    if (lastState) _applyState(lastState);
+                    onComplete(lastState);
+                }
                 return;
             }
             API.recordCricketThrow(_state.matchId, {
@@ -662,7 +646,6 @@ var CRICKET_GAME = (function () {
             })
             .catch(function(err) {
                 console.error('[cricket] flush error dart ' + i + ':', err);
-                // Continue flushing remaining darts even on error
                 sendNext(i + 1);
             });
         }
@@ -681,9 +664,14 @@ var CRICKET_GAME = (function () {
         var undoBtn = document.getElementById('cricket-undo-btn');
         if (undoBtn) undoBtn.disabled = true;
 
-        // Ensure any un-flushed darts reach the server before advancing.
-        // (Normally flushed already after dart 3, but guards edge cases.)
         function _advance() {
+            // Rotate to next player
+            var currentIndex = _state.players.findIndex(function(p) {
+                return String(p.id) === String(_state.currentPlayerId);
+            });
+            var nextIndex = (currentIndex + 1) % _state.players.length;
+            _state.currentPlayerId = String(_state.players[nextIndex].id);
+
             _state.turnComplete  = false;
             _state.dartsThisTurn = 0;
             _state.multiplier    = 1;
@@ -691,7 +679,6 @@ var CRICKET_GAME = (function () {
             _clearPills();
             _updateActivePlayer();
 
-            // Reset multiplier tab to single
             var tabs = document.getElementById('cricket-tabs');
             if (tabs) {
                 tabs.querySelectorAll('.tab-btn').forEach(function (b) {
@@ -719,17 +706,19 @@ var CRICKET_GAME = (function () {
     function _onUndo() {
         if (_state.cpuTurnRunning) return;
 
-        // If the dart is still in the local buffer, pop it without a server call
         if (_state.pendingDarts.length > 0) {
             _state.pendingDarts.pop();
             _state.dartsThisTurn--;
             _state.turnComplete = false;
 
-            // Re-sync local marks/scores from server state (simplest correctness guarantee)
             _lockBoard(true);
             API.getCricketMatch(_state.matchId)
                 .then(function(s) {
+                    // Preserve local player rotation when syncing for undo
+                    var savedPlayerId = _state.currentPlayerId;
                     _applyState(s);
+                    _state.currentPlayerId = savedPlayerId;
+
                     var board = document.getElementById('cricket-sidebar');
                     if (board) _renderBoard(board);
 
@@ -747,11 +736,13 @@ var CRICKET_GAME = (function () {
             return;
         }
 
-        // Dart already flushed to server — use server undo
         _lockBoard(true);
         API.undoCricketThrow(_state.matchId)
             .then(function (s) {
+                var savedPlayerId = _state.currentPlayerId;
                 _applyState(s);
+                _state.currentPlayerId = savedPlayerId;
+
                 var board = document.getElementById('cricket-sidebar');
                 if (board) _renderBoard(board);
 
@@ -759,7 +750,7 @@ var CRICKET_GAME = (function () {
                 if (pills && pills.lastChild) pills.removeChild(pills.lastChild);
 
                 _state.turnComplete  = false;
-                _state.dartsThisTurn = s.darts_this_turn || 0;
+                _state.dartsThisTurn = Math.max(0, _state.dartsThisTurn - 1);
                 var nextBtn = document.getElementById('cricket-next-btn');
                 if (nextBtn) nextBtn.disabled = true;
                 var undoBtn = document.getElementById('cricket-undo-btn');
@@ -817,7 +808,7 @@ var CRICKET_GAME = (function () {
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // Board locking
+    // Board locking / status
     // ─────────────────────────────────────────────────────────────────
 
     function _updateStatusBanner(el) {
@@ -885,10 +876,6 @@ var CRICKET_GAME = (function () {
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // Speech
-    // ─────────────────────────────────────────────────────────────────
-
-    // ─────────────────────────────────────────────────────────────────
     // CPU turn
     // ─────────────────────────────────────────────────────────────────
 
@@ -941,7 +928,6 @@ var CRICKET_GAME = (function () {
     function _cpuIntend() {
         var pid    = String(_state.cpuPlayerId);
         var myMarks = _state.marks[pid] || {};
-        // Priority: close numbers 20→15→Bull
         var targets = [20, 19, 18, 17, 16, 15, 25];
         for (var i = 0; i < targets.length; i++) {
             var n = targets[i];
@@ -949,7 +935,6 @@ var CRICKET_GAME = (function () {
                 return { segment: n, multiplier: n === 25 ? 2 : 3 };
             }
         }
-        // All closed — score on numbers opponents still have open
         for (var j = 0; j < targets.length; j++) {
             var n2 = targets[j];
             var oppOpen = _state.players.some(function(p) {
@@ -985,7 +970,6 @@ var CRICKET_GAME = (function () {
         setTimeout(function() {
             if (_state.status !== 'active') { _state.cpuTurnRunning = false; return; }
 
-            // CPU uses direct server call (no local buffer) so board stays authoritative
             API.recordCricketThrow(_state.matchId, {
                 player_id:  _state.cpuPlayerId,
                 segment:    actual.segment,
@@ -997,12 +981,12 @@ var CRICKET_GAME = (function () {
 
                 var board = document.getElementById('cricket-sidebar');
                 if (board) _renderBoard(board);
-                _addPill(last.segment, last.multiplier, last.marks_added, last.points_scored);
+                if (last) _addPill(last.segment, last.multiplier, last.marks_added, last.points_scored);
                 _updateStatusBanner();
 
                 if (typeof SOUNDS !== 'undefined' && SOUNDS.isEnabled()) {
                     if (s.status === 'complete') SOUNDS.checkout();
-                    else if (last.points_scored > 0) SOUNDS.ton();
+                    else if (last && last.points_scored > 0) SOUNDS.ton();
                     else SOUNDS.dart();
                 }
 
@@ -1013,7 +997,7 @@ var CRICKET_GAME = (function () {
                     return;
                 }
 
-                if (SPEECH.isEnabled()) {
+                if (SPEECH.isEnabled() && last) {
                     var speechPts = last.segment === 0 ? 0 : (last.points_scored > 0 ? last.points_scored : 1);
                     var phrase    = last.segment === 0 ? 'Miss'
                                   : (last.multiplier === 3 ? 'Treble ' : last.multiplier === 2 ? 'Double ' : '')
@@ -1040,8 +1024,6 @@ var CRICKET_GAME = (function () {
         var player = _state.players.find(function (p) { return String(p.id) === String(_state.currentPlayerId); });
         if (!player) return;
         if (_state.isFirstTurn) {
-            // First turn: speak welcome then player announce as a chain,
-            // each in its own setTimeout so iOS TTS wakes up between them.
             _state.isFirstTurn = false;
             var welcomeMsg = 'Welcome to Cricket darts.';
             var playerMsg  = player.name + "'s turn to throw";
@@ -1049,8 +1031,6 @@ var CRICKET_GAME = (function () {
                 window.speechSynthesis && window.speechSynthesis.cancel();
                 SPEECH.speak(welcomeMsg, { rate: 1.05, pitch: 1.0 });
             }, 400);
-            // Delay player announce until after welcome finishes
-            // 400ms start delay + 300ms TTS startup + 150ms/char
             var welcomeDur = 400 + 300 + welcomeMsg.length * 150;
             setTimeout(function () {
                 window.speechSynthesis && window.speechSynthesis.cancel();

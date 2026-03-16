@@ -36,18 +36,15 @@ const LEGACY_SCRIPTS = [
 
 async function boot() {
     try {
-        // Load all legacy scripts in order
         for (const src of LEGACY_SCRIPTS) {
             await loadScript(src);
         }
         console.log('[main] Legacy scripts loaded');
 
-        // Initialise database
         await initDatabase();
         window._db = getDb();
         console.log('[main] Database ready');
 
-        // Signal app.js to initialise
         window.dispatchEvent(new Event('dbready'));
 
     } catch (err) {

@@ -3,29 +3,45 @@
  * ---------
  * Darts scorer speech synthesis.
  *
- * Speaks dart scores and remaining totals in classic caller style.
- * Built on Web Speech Synthesis API (supported Safari 7+ / iOS 7+).
+ * Uses @capacitor-community/text-to-speech for Android/iOS native TTS.
+ * Falls back to Web Speech API if the Capacitor plugin is not available
+ * (e.g. when running in a desktop browser during development).
  *
- * Public API:
- *   SPEECH.isSupported()               → bool
- *   SPEECH.isEnabled()                 → bool
- *   SPEECH.setEnabled(bool)            → void
- *   SPEECH.announceDartScore(seg,mul,pts) → void — called after each dart
- *   SPEECH.announcePlayer(name)         → void — called at start of each turn
- *   SPEECH.announceRemaining(score)    → void  — called after turn ends (score ≤ 170)
- *   SPEECH.announceBust()              → void
- *   SPEECH.announceCheckout(points)    → void
+ * Public API (unchanged from original):
+ *   SPEECH.isSupported()                  → bool
+ *   SPEECH.isEnabled()                    → bool
+ *   SPEECH.setEnabled(bool)               → void
+ *   SPEECH.unlock()                       → void  (no-op for native TTS)
+ *   SPEECH.speak(text, options)           → void
+ *   SPEECH.announceDartScore(seg,mul,pts) → void
+ *   SPEECH.announcePlayer(name)           → void
+ *   SPEECH.announceWelcome(gameType)      → void
+ *   SPEECH.announceShanghai(name, target) → void
+ *   SPEECH.announceTurnEnd(pts, rem)      → void
+ *   SPEECH.announceBust()                 → void
+ *   SPEECH.announceCheckout(points)       → void
+ *   SPEECH.announceCricketWin(name)       → void
+ *   SPEECH.announceTimer(phrase)          → void
  */
 
-var SPEECH = (function() {
+var SPEECH = (function () {
 
     var _enabled = true;
 
     // ------------------------------------------------------------------
-    // Support check
+    // Detect which TTS engine to use
     // ------------------------------------------------------------------
 
+    function _getPlugin() {
+        return (window.Capacitor &&
+                window.Capacitor.Plugins &&
+                window.Capacitor.Plugins.TextToSpeech)
+            ? window.Capacitor.Plugins.TextToSpeech
+            : null;
+    }
+
     function isSupported() {
+        if (_getPlugin()) return true;
         return !!(window.speechSynthesis && window.SpeechSynthesisUtterance);
     }
 
@@ -33,108 +49,214 @@ var SPEECH = (function() {
 
     function setEnabled(val) {
         _enabled = !!val;
-        // Cancel any in-flight speech when toggled off
-        if (!_enabled && isSupported()) window.speechSynthesis.cancel();
+        if (!_enabled) {
+            var plugin = _getPlugin();
+            if (plugin) {
+                plugin.stop().catch(function () {});
+            } else if (window.speechSynthesis) {
+                window.speechSynthesis.cancel();
+            }
+        }
     }
 
     // ------------------------------------------------------------------
-    // Voice selection — British male, consistent across the app
+    // Voice selection for native TTS
+    // Preferred en-GB voices in priority order based on Android availability
     // ------------------------------------------------------------------
 
-    // Preferred voice names in priority order (iOS / macOS / Android / Windows)
-    var PREFERRED_VOICES = [
-        'Daniel',           // iOS/macOS — British male (best match)
-        'Arthur',           // macOS Ventura+ British male
-        'Google UK English Male',   // Chrome / Android
-        'Microsoft George', // Windows British male
-        'en-GB',            // fallback: any en-GB voice
+    var _cachedVoiceURI = null;
+    var _voicesLoaded   = false;
+    var _voiceList      = [];
+
+    var PREFERRED_VOICE_URIS = [
+        'en-gb-x-gba-local',   // British English local (Android)
+        'en-gb-x-gbb-local',   // British English local variant
+        'en-gb-x-gbc-local',   // British English local variant
+        'en-gb-x-gbd-local',   // British English local variant
+        'en-gb-x-gbe-local',   // British English local variant
+        'en-gb-x-rjs-local',   // British English local variant
     ];
 
-    var _voice = null;       // cached after first successful lookup
-    var _voiceLoadAttempts = 0;
+    function _loadVoices() {
+        if (_voicesLoaded) return Promise.resolve();
+        var plugin = _getPlugin();
+        if (!plugin) { _voicesLoaded = true; return Promise.resolve(); }
+        return plugin.getSupportedVoices()
+            .then(function (result) {
+                _voiceList = result.voices || [];
+                _voicesLoaded = true;
+                // Pre-select best en-GB voice
+                _pickVoiceURI();
+            })
+            .catch(function () {
+                _voicesLoaded = true;
+            });
+    }
 
-    function _pickVoice() {
-        if (_voice) return _voice;
-        if (!isSupported()) return null;
-        var voices = window.speechSynthesis.getVoices();
-        if (!voices || voices.length === 0) return null;
+    function _pickVoiceURI() {
+        if (_cachedVoiceURI) return _cachedVoiceURI;
 
-        // Try preferred names first (case-insensitive partial match)
-        for (var pi = 0; pi < PREFERRED_VOICES.length; pi++) {
-            var pref = PREFERRED_VOICES[pi].toLowerCase();
-            for (var vi = 0; vi < voices.length; vi++) {
-                var v = voices[vi];
-                if (v.name.toLowerCase().indexOf(pref) !== -1) {
-                    _voice = v;
-                    return _voice;
-                }
+        // Try preferred URIs first
+        for (var i = 0; i < PREFERRED_VOICE_URIS.length; i++) {
+            var pref = PREFERRED_VOICE_URIS[i];
+            var found = _voiceList.find(function (v) {
+                return v.voiceURI === pref;
+            });
+            if (found) {
+                _cachedVoiceURI = found.voiceURI;
+                return _cachedVoiceURI;
             }
         }
 
-        // Last resort: any en-GB voice
-        for (var vi2 = 0; vi2 < voices.length; vi2++) {
-            if (voices[vi2].lang && voices[vi2].lang.indexOf('en-GB') !== -1) {
-                _voice = voices[vi2];
-                return _voice;
-            }
+        // Fall back to any local en-GB voice
+        var engb = _voiceList.find(function (v) {
+            return v.lang === 'en-GB' && v.localService;
+        });
+        if (engb) {
+            _cachedVoiceURI = engb.voiceURI;
+            return _cachedVoiceURI;
+        }
+
+        // Fall back to any en-GB voice
+        var anyEngb = _voiceList.find(function (v) {
+            return v.lang === 'en-GB';
+        });
+        if (anyEngb) {
+            _cachedVoiceURI = anyEngb.voiceURI;
+            return _cachedVoiceURI;
+        }
+
+        // Fall back to any en-US voice
+        var enus = _voiceList.find(function (v) {
+            return v.lang === 'en-US' && v.localService;
+        });
+        if (enus) {
+            _cachedVoiceURI = enus.voiceURI;
+            return _cachedVoiceURI;
         }
 
         return null;
     }
 
-    // iOS loads voices asynchronously — listen for the event and cache the result
-    if (typeof window !== 'undefined' && window.speechSynthesis) {
-        window.speechSynthesis.onvoiceschanged = function () {
-            _voice = null;   // reset so next _pickVoice() re-evaluates
-            _pickVoice();
-        };
-    }
+    // Initialise voice list as soon as possible
+    _loadVoices();
 
     // ------------------------------------------------------------------
-    // Core speak helper
+    // Core speak helper — queues utterances sequentially
     // ------------------------------------------------------------------
 
-    function _speak(text, priority, options) {
-        if (!_enabled || !isSupported()) return;
-        if (priority) window.speechSynthesis.cancel();
-        var u = new SpeechSynthesisUtterance(text);
-        var v = _pickVoice();
-        if (v) {
-            u.voice = v;
-            u.lang  = v.lang;
+    var _speakQueue  = [];
+    var _speakBusy   = false;
+
+    function _processQueue() {
+        if (_speakBusy || _speakQueue.length === 0) return;
+        var item = _speakQueue.shift();
+        _speakBusy = true;
+
+        var plugin = _getPlugin();
+
+        if (plugin) {
+            var voiceURI = _pickVoiceURI();
+            var params = {
+                text:     item.text,
+                lang:     'en-GB',
+                rate:     item.rate  || 1.05,
+                pitch:    item.pitch || 1.0,
+                volume:   item.volume || 1.0,
+                category: 'ambient',
+            };
+            if (voiceURI) params.voiceURI = voiceURI;
+
+            plugin.speak(params)
+                .then(function () {
+                    _speakBusy = false;
+                    _processQueue();
+                })
+                .catch(function (err) {
+                    console.warn('[speech] TTS error:', err);
+                    _speakBusy = false;
+                    _processQueue();
+                });
+        } else if (window.speechSynthesis) {
+            // Web Speech API fallback (desktop browser)
+            var u = new SpeechSynthesisUtterance(item.text);
+            u.lang    = 'en-GB';
+            u.rate    = item.rate   || 1.05;
+            u.pitch   = item.pitch  || 1.0;
+            u.volume  = item.volume || 1.0;
+            u.onend   = function () { _speakBusy = false; _processQueue(); };
+            u.onerror = function () { _speakBusy = false; _processQueue(); };
+            window.speechSynthesis.speak(u);
         } else {
-            u.lang  = 'en-GB';
+            _speakBusy = false;
         }
-        u.rate   = (options && options.rate)   || 1.05;
-        u.pitch  = (options && options.pitch)  || 1.0;
-        u.volume = (options && options.volume) || 1.0;
-        window.speechSynthesis.speak(u);
+    }
+
+    function _speak(text, interrupt, options) {
+        if (!_enabled || !isSupported()) return;
+        if (interrupt) {
+            // Cancel current speech and clear queue
+            _speakQueue = [];
+            _speakBusy  = false;
+            var plugin = _getPlugin();
+            if (plugin) {
+                plugin.stop().catch(function () {}).finally(function () {
+                    _speakQueue.push({
+                        text:   text,
+                        rate:   (options && options.rate)   || 1.05,
+                        pitch:  (options && options.pitch)  || 1.0,
+                        volume: (options && options.volume) || 1.0,
+                    });
+                    _processQueue();
+                });
+            } else {
+                if (window.speechSynthesis) window.speechSynthesis.cancel();
+                _speakQueue.push({
+                    text:   text,
+                    rate:   (options && options.rate)   || 1.05,
+                    pitch:  (options && options.pitch)  || 1.0,
+                    volume: (options && options.volume) || 1.0,
+                });
+                _processQueue();
+            }
+        } else {
+            _speakQueue.push({
+                text:   text,
+                rate:   (options && options.rate)   || 1.05,
+                pitch:  (options && options.pitch)  || 1.0,
+                volume: (options && options.volume) || 1.0,
+            });
+            _processQueue();
+        }
     }
 
     // ------------------------------------------------------------------
-    // Public raw speak — used by game modules that call speech directly.
-    // Applies the same voice selection as _speak.
+    // Public raw speak
     // ------------------------------------------------------------------
 
     function speak(text, options) {
-        if (!_enabled || !isSupported()) return;
-        var u = new SpeechSynthesisUtterance(text);
-        var v = _pickVoice();
-        if (v) {
-            u.voice = v;
-            u.lang  = v.lang;
-        } else {
-            u.lang  = 'en-GB';
-        }
-        u.rate   = (options && options.rate)   || 1.0;
-        u.pitch  = (options && options.pitch)  || 1.0;
-        u.volume = (options && options.volume) || 1.0;
-        window.speechSynthesis.speak(u);
+        _speak(text, false, options);
     }
 
     // ------------------------------------------------------------------
-    // Score phrasing
-    // Classic darts caller phrases for notable scores
+    // unlock — no-op for native TTS, kept for API compatibility
+    // ------------------------------------------------------------------
+
+    function unlock() {
+        // Native TTS doesn't need an unlock gesture.
+        // For Web Speech API fallback, fire a silent utterance.
+        if (!_getPlugin() && window.speechSynthesis) {
+            var u = new SpeechSynthesisUtterance('');
+            u.volume = 0;
+            u.rate   = 10;
+            window.speechSynthesis.speak(u);
+        }
+        // Preload voices if not done yet
+        _loadVoices();
+    }
+
+    // ------------------------------------------------------------------
+    // Score phrasing (identical to original)
     // ------------------------------------------------------------------
 
     var SPECIAL_SCORES = {
@@ -164,7 +286,6 @@ var SPEECH = (function() {
         85:  'Eighty five',
     };
 
-    // Numbers 1–20 as words (for "N remaining" phrasing)
     var ONES = ['', 'one', 'two', 'three', 'four', 'five', 'six', 'seven',
                 'eight', 'nine', 'ten', 'eleven', 'twelve', 'thirteen',
                 'fourteen', 'fifteen', 'sixteen', 'seventeen', 'eighteen',
@@ -185,8 +306,6 @@ var SPEECH = (function() {
             if (rest === 0) return 'one hundred';
             return 'one hundred and ' + _numberToWords(rest);
         }
-        // 200–180 range handled above via SPECIAL_SCORES mostly,
-        // but handle generically just in case
         var h = Math.floor(n / 100);
         var r = n % 100;
         var base = ONES[h] + ' hundred';
@@ -195,34 +314,22 @@ var SPEECH = (function() {
 
     function _phraseScore(points) {
         if (SPECIAL_SCORES[points]) return SPECIAL_SCORES[points];
-
-        // Ton+ range (101–179, excluding specials above)
         if (points >= 101 && points <= 180) {
             return 'One hundred and ' + _numberToWords(points - 100);
         }
-
         return _numberToWords(points);
     }
 
     function _phraseRemaining(score) {
-        // e.g. "Forty five remaining" / "double top to finish" etc.
-        if (score === 0)  return '';           // already checked out
+        if (score === 0)  return '';
         if (score === 2)  return 'Double one';
         if (score === 50) return 'Bulls Eye';
-
-        // Clean double finish
         if (score <= 40 && score % 2 === 0) {
             return 'Double ' + _numberToWords(score / 2) + ' remaining';
         }
-
         return _numberToWords(score) + ' remaining';
     }
 
-    // ------------------------------------------------------------------
-    // Public announcement methods
-    // ------------------------------------------------------------------
-
-    // Segment names for caller phrasing
     var SEGMENT_NAMES = {
         25: 'Outer Bull',
         20: 'twenty',  19: 'nineteen', 18: 'eighteen', 17: 'seventeen',
@@ -232,49 +339,31 @@ var SPEECH = (function() {
          4: 'four',     3: 'three',     2: 'two',          1: 'one',
     };
 
-    /**
-     * Build a caller phrase for a single dart using segment + multiplier.
-     * e.g. segment=20, multiplier=3 → "Treble twenty"
-     *      segment=20, multiplier=2 → "Double twenty"
-     *      segment=20, multiplier=1 → "Twenty"
-     *      segment=25, multiplier=2 → "Bulls Eye"  (double bull)
-     *      segment=25, multiplier=1 → "Outer Bull"
-     */
     function _phraseDart(segment, multiplier, points) {
         if (points === 0) return 'Miss';
-
         var segName = SEGMENT_NAMES[segment] || _numberToWords(segment);
-
-        // Bull / Bullseye
         if (segment === 25) {
             return multiplier === 2 ? 'Bulls Eye' : 'Outer Bull';
         }
-
         if (multiplier === 3) return 'Treble ' + segName;
         if (multiplier === 2) return 'Double ' + segName;
         return segName.charAt(0).toUpperCase() + segName.slice(1);
     }
 
-    /**
-     * Speak the score of a single dart throw.
-     * Called immediately after each dart is recorded.
-     *
-     * @param {number} segment    — board segment hit (0-25)
-     * @param {number} multiplier — 1=single, 2=double, 3=treble
-     * @param {number} points     — calculated points (used as fallback)
-     */
+    // ------------------------------------------------------------------
+    // Public announcement methods (identical signatures to original)
+    // ------------------------------------------------------------------
+
     function announceDartScore(segment, multiplier, points) {
         if (!_enabled) return;
         _speak(_phraseDart(segment, multiplier, points), true);
     }
 
-    /**
-     * Announce whose turn it is to throw.
-     * @param {string} playerName
-     */
     function announceWelcome(gameType) {
         if (!_enabled) return;
-        var spoken = gameType === '501' ? 'Five-oh-one' : gameType === '201' ? 'Two-oh-one' : gameType;
+        var spoken = gameType === '501' ? 'Five-oh-one'
+                   : gameType === '201' ? 'Two-oh-one'
+                   : gameType;
         _speak('Welcome to ' + spoken + ' darts.', false);
     }
 
@@ -283,43 +372,23 @@ var SPEECH = (function() {
         _speak(playerName + "'s turn to throw", false);
     }
 
-    /**
-     * Shanghai-specific turn announcement.
-     * Says "{Name}, your number is {target}"
-     * @param {string} playerName
-     * @param {string|number} target  — e.g. "7" or "Bull"
-     */
     function announceShanghai(playerName, target) {
         if (!_enabled) return;
         _speak(playerName + ', your number is ' + target, false);
     }
 
-    /**
-     * Speak the turn total and remaining score after a full turn.
-     * Only announces remaining if score ≤ 170.
-     *
-     * @param {number} turnPoints  — total scored this turn (score_before - score_after)
-     * @param {number} remaining   — player's score after the turn
-     */
     function announceTurnEnd(turnPoints, remaining) {
-        // Sound effects first (non-blocking)
         if (typeof SOUNDS !== 'undefined' && SOUNDS.isEnabled()) {
-            if (turnPoints === 180) {
-                SOUNDS.oneEighty();
-            } else if (turnPoints >= 100) {
-                SOUNDS.ton();
-            }
+            if (turnPoints === 180) SOUNDS.oneEighty();
+            else if (turnPoints >= 100) SOUNDS.ton();
         }
-
         if (!_enabled) return;
 
         var phrase = _phraseScore(turnPoints);
-
         if (remaining > 0 && remaining <= 170) {
             phrase = phrase + '... ' + _phraseRemaining(remaining);
         }
 
-        // 180 and 170 get emphatic treatment — louder, slightly slower, higher pitch
         if (turnPoints === 180) {
             _speak(phrase, true, { rate: 0.9, pitch: 1.3, volume: 1.0 });
         } else if (turnPoints === 170) {
@@ -329,9 +398,17 @@ var SPEECH = (function() {
         }
     }
 
-    /**
-     * Speak a bust.
-     */
+    function announceBust() {
+        if (typeof SOUNDS !== 'undefined' && SOUNDS.isEnabled()) SOUNDS.bust();
+        _speak('Bust!', true);
+    }
+
+    function announceCheckout(points) {
+        if (typeof SOUNDS !== 'undefined' && SOUNDS.isEnabled()) SOUNDS.checkout();
+        var phrase = _phraseScore(points) + '... checkout!';
+        _speak(phrase, true);
+    }
+
     function announceCricketWin(playerName) {
         if (!_enabled) return;
         _speak(playerName + ', You are winner! Hah! Hah! Hah!', true, { rate: 0.88, pitch: 1.25, volume: 1.0 });
@@ -342,56 +419,21 @@ var SPEECH = (function() {
         _speak(phrase, true);
     }
 
-    function announceBust() {
-        if (typeof SOUNDS !== 'undefined' && SOUNDS.isEnabled()) {
-            SOUNDS.bust();
-        }
-        _speak('Bust!', true);
-    }
-
-    /**
-     * Speak a checkout.
-     * @param {number} points — the score checked out on
-     */
-    function announceCheckout(points) {
-        if (typeof SOUNDS !== 'undefined' && SOUNDS.isEnabled()) {
-            SOUNDS.checkout();
-        }
-        var phrase = _phraseScore(points) + '... checkout!';
-        _speak(phrase, true);
-    }
-
-    // ------------------------------------------------------------------
-
-    /**
-     * Unlock the iOS speech engine by firing a silent utterance inside a
-     * user gesture handler. Must be called directly within a tap/click event
-     * (e.g. the Start Match button) before any programmatic speech is needed.
-     * Safe to call on non-iOS platforms — it's a no-op if already unlocked.
-     */
-    function unlock() {
-        if (!isSupported()) return;
-        var u = new SpeechSynthesisUtterance('');
-        u.volume = 0;
-        u.rate   = 10;   // finish instantly
-        window.speechSynthesis.speak(u);
-    }
-
     // ------------------------------------------------------------------
 
     return {
-        isSupported:       isSupported,
-        speak:             speak,
-        isEnabled:         isEnabled,
-        setEnabled:        setEnabled,
-        unlock:            unlock,
-        announceDartScore: announceDartScore,
-        announceWelcome:   announceWelcome,
-        announcePlayer:    announcePlayer,
-        announceShanghai:  announceShanghai,
-        announceTurnEnd:   announceTurnEnd,
-        announceBust:      announceBust,
-        announceCheckout:  announceCheckout,
+        isSupported:        isSupported,
+        isEnabled:          isEnabled,
+        setEnabled:         setEnabled,
+        unlock:             unlock,
+        speak:              speak,
+        announceDartScore:  announceDartScore,
+        announceWelcome:    announceWelcome,
+        announcePlayer:     announcePlayer,
+        announceShanghai:   announceShanghai,
+        announceTurnEnd:    announceTurnEnd,
+        announceBust:       announceBust,
+        announceCheckout:   announceCheckout,
         announceCricketWin: announceCricketWin,
         announceTimer:      announceTimer,
     };
