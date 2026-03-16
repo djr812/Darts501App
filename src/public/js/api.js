@@ -840,6 +840,470 @@ const API = (() => {
     }
 
     // ------------------------------------------------------------------
+    // Generic helpers for simple game modes
+    // ------------------------------------------------------------------
+
+    // Creates a base match + game record, returns a consistent state shape
+    async function _createSimpleMatch(gameType, config, extraInsert) {
+        const db = window._db;
+        const matchResult = await db.run(
+            `INSERT INTO matches (game_type, status, legs_to_win) VALUES (?, 'active', 1)`,
+            [gameType]
+        );
+        const matchId = matchResult.changes.lastId;
+        for (let i = 0; i < config.player_ids.length; i++) {
+            await db.run(
+                `INSERT INTO match_players (match_id, player_id, position) VALUES (?, ?, ?)`,
+                [matchId, config.player_ids[i], i]
+            );
+        }
+        let gameId = null;
+        if (extraInsert) gameId = await extraInsert(matchId);
+        return { matchId, gameId };
+    }
+
+    async function _getSimplePlayers(matchId) {
+        const db = window._db;
+        const result = await db.query(
+            `SELECT p.id, p.name FROM match_players mp
+             JOIN players p ON p.id = mp.player_id
+             WHERE mp.match_id = ? ORDER BY mp.position`,
+            [matchId]
+        );
+        return result.values || [];
+    }
+
+    function _buildSimpleState(matchId, gameId, players, currentPlayerIndex, extraFields) {
+        const currentPlayer = players[currentPlayerIndex] || players[0] || {};
+        return {
+            match_id:             matchId,
+            game_id:              gameId,
+            players:              players,
+            current_player_index: currentPlayerIndex,
+            current_player_id:    currentPlayer.id || null,
+            status:               'active',
+            winner_id:            null,
+            events:               [],
+            ...extraFields,
+        };
+    }
+
+    async function _endSimpleMatch(matchId) {
+        const db = window._db;
+        await db.run(
+            `UPDATE matches SET status = 'cancelled', completed_at = datetime('now') WHERE id = ?`,
+            [matchId]
+        );
+        return { ok: true };
+    }
+
+    async function _completeSimpleMatch(matchId) {
+        const db = window._db;
+        await db.run(
+            `UPDATE matches SET status = 'complete', completed_at = datetime('now') WHERE id = ?`,
+            [matchId]
+        );
+    }
+
+    // Store throws in a generic JSON blob attached to a match
+    // We use legs table as a simple turn log
+    async function _logThrows(matchId, playerId, throws) {
+        const db = window._db;
+        for (let i = 0; i < throws.length; i++) {
+            const t = throws[i];
+            await db.run(
+                `INSERT INTO throws (turn_id, player_id, segment, multiplier, score, throw_order)
+                 SELECT id, ?, ?, ?, ?, ?
+                 FROM turns WHERE leg_id IN (SELECT id FROM legs WHERE match_id = ?)
+                 ORDER BY id DESC LIMIT 1`,
+                [playerId, t.segment || 0, t.multiplier || 1,
+                 (t.segment || 0) * (t.multiplier || 1), i + 1, matchId]
+            );
+        }
+    }
+
+    async function _ensureTurn(matchId, playerId) {
+        const db = window._db;
+        // Ensure a leg exists
+        let legResult = await db.query(
+            'SELECT id FROM legs WHERE match_id = ? LIMIT 1', [matchId]
+        );
+        let legId;
+        if ((legResult.values || []).length === 0) {
+            const lr = await db.run(
+                `INSERT INTO legs (match_id, leg_number, starting_score) VALUES (?, 1, 0)`,
+                [matchId]
+            );
+            legId = lr.changes.lastId;
+        } else {
+            legId = legResult.values[0].id;
+        }
+        // Insert a turn record
+        const tr = await db.run(
+            `INSERT INTO turns (leg_id, player_id, turn_number, score, remaining, is_bust)
+             VALUES (?, ?, 1, 0, 0, 0)`,
+            [legId, playerId]
+        );
+        return { legId, turnId: tr.changes.lastId };
+    }
+
+    // ------------------------------------------------------------------
+    // Race to 1000
+    // ------------------------------------------------------------------
+
+    async function createRace1000Match(config) {
+        const db = window._db;
+        const { matchId } = await _createSimpleMatch('Race1000', config, async (mid) => {
+            const r = await db.run(
+                `INSERT INTO legs (match_id, leg_number, starting_score) VALUES (?, 1, 0)`, [mid]
+            );
+            return r.changes.lastId;
+        });
+        const players = await _getSimplePlayers(matchId);
+        // Give each player a score field
+        const playersWithScore = players.map(p => ({ ...p, score: 0 }));
+        return _buildSimpleState(matchId, null, playersWithScore, 0, {
+            variant: config.variant || 'twenties',
+        });
+    }
+
+    async function race1000Throw(matchId, data) {
+        // Race1000 manages all scoring locally — no DB writes needed
+        return { ok: true };
+    }
+
+    async function race1000Next(matchId, data) {
+        const playerRows = await _getSimplePlayers(matchId);
+
+        // Carry scores forward from data.players (passed by race1000.js _onNext)
+        const playersWithScore = playerRows.map(function(p) {
+            const existing = (data && data.players)
+                ? data.players.find(function(dp) { return String(dp.id) === String(p.id); })
+                : null;
+            return Object.assign({}, p, { score: existing ? (existing.score || 0) : 0 });
+        });
+
+        const currentIndex = (data && data.current_player_index !== undefined)
+            ? data.current_player_index : 0;
+        const nextIndex = (currentIndex + 1) % playerRows.length;
+
+        // Build scored event for the player who just threw so race1000.js
+        // _onNext can update pl.score via scoredEv and speak the turn total
+        const events = [];
+        if (data && data.players) {
+            const currentPlayer = playersWithScore[currentIndex];
+            if (currentPlayer) {
+                const turnScore = (data.turn_score !== undefined) ? data.turn_score : 0;
+                events.push({
+                    type:      'scored',
+                    player_id: currentPlayer.id,
+                    new_score: currentPlayer.score,
+                    // turn_points is the delta this turn — used by _speakTurnEnd
+                    turn_points: turnScore,
+                });
+                // Check for win
+                if (currentPlayer.score >= 1000) {
+                    events.push({
+                        type:      'winner',
+                        player_id: currentPlayer.id,
+                    });
+                }
+            }
+        }
+
+        return _buildSimpleState(matchId, null, playersWithScore, nextIndex, {
+            variant:     (data && data.variant) ? data.variant : 'twenties',
+            events:      events,
+            turn_number: (data && data.turn_number) ? data.turn_number + 1 : 2,
+        });
+    }
+
+    async function restartRace1000Match(matchId) {
+        const players = await _getSimplePlayers(matchId);
+        await _completeSimpleMatch(matchId);
+        // Create new match with same players
+        const playerIds = players.map(p => p.id);
+        return createRace1000Match({ player_ids: playerIds, variant: 'twenties' });
+    }
+
+    async function endRace1000Match(matchId) {
+        return _endSimpleMatch(matchId);
+    }
+
+    // ------------------------------------------------------------------
+    // Nine Lives
+    // ------------------------------------------------------------------
+
+    async function createNineLivesMatch(config) {
+        const { matchId } = await _createSimpleMatch('NineLives', config, null);
+        const players = await _getSimplePlayers(matchId);
+        // Each player starts at target=1, lives=9
+        const playersWithState = players.map(p => ({
+            ...p, target: 1, lives: 9, eliminated: false, completed: false,
+        }));
+        return _buildSimpleState(matchId, null, playersWithState, 0, {
+            game_id: matchId,
+        });
+    }
+
+    async function nineLivesThrow(matchId, data) {
+        return { ok: true, events: [] };
+    }
+
+    async function nineLivesNext(matchId, data) {
+        const playerRows = await _getSimplePlayers(matchId);
+        const currentIndex = (data && data.current_player_index !== undefined)
+            ? data.current_player_index : 0;
+        const nextIndex = (currentIndex + 1) % playerRows.length;
+        // Merge server player list with any state passed in data.players
+        const playersWithState = playerRows.map(function(p) {
+            const existing = (data && data.players)
+                ? data.players.find(function(dp) { return String(dp.id) === String(p.id); })
+                : null;
+            return Object.assign({}, p, existing || { target: 1, lives: 9, eliminated: false, completed: false });
+        });
+        return _buildSimpleState(matchId, matchId, playersWithState, nextIndex, {
+            events: (data && data.events) ? data.events : [],
+        });
+    }
+
+    async function restartNineLivesMatch(matchId) {
+        const players = await _getSimplePlayers(matchId);
+        return createNineLivesMatch({ player_ids: players.map(p => p.id) });
+    }
+
+    async function endNineLivesMatch(matchId) {
+        return _endSimpleMatch(matchId);
+    }
+
+    // ------------------------------------------------------------------
+    // Killer
+    // ------------------------------------------------------------------
+
+    async function createKillerMatch(config) {
+        const { matchId } = await _createSimpleMatch('Killer', config, null);
+        const players = await _getSimplePlayers(matchId);
+
+        // Assign random unique numbers 1-20 to each player
+        const nums = Array.from({length: 20}, (_, i) => i + 1);
+        for (let i = nums.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [nums[i], nums[j]] = [nums[j], nums[i]];
+        }
+
+        const playersWithState = players.map((p, i) => ({
+            ...p,
+            assigned_number: nums[i],
+            hits:            0,
+            is_killer:       false,
+            lives:           3,
+            eliminated:      false,
+        }));
+
+        return _buildSimpleState(matchId, null, playersWithState, 0, {
+            game_id: matchId,
+            variant: config.variant || 'doubles',
+        });
+    }
+
+    async function killerThrow(matchId, data) {
+        return { ok: true, events: [] };
+    }
+
+    async function killerNext(matchId, data) {
+        const playerRows = await _getSimplePlayers(matchId);
+        const currentIndex = data ? (data.current_player_index || 0) : 0;
+        const nextIndex = (currentIndex + 1) % playerRows.length;
+        return _buildSimpleState(matchId, matchId, playerRows, nextIndex, {
+            variant: data ? (data.variant || 'doubles') : 'doubles',
+            events:  [],
+        });
+    }
+
+    async function restartKillerMatch(matchId) {
+        const players = await _getSimplePlayers(matchId);
+        return createKillerMatch({ player_ids: players.map(p => p.id), variant: 'doubles' });
+    }
+
+    async function endKillerMatch(matchId) {
+        return _endSimpleMatch(matchId);
+    }
+
+    // ------------------------------------------------------------------
+    // Bermuda Triangle
+    // ------------------------------------------------------------------
+
+    async function createBermudaMatch(config) {
+        const { matchId } = await _createSimpleMatch('Bermuda', config, null);
+        const players = await _getSimplePlayers(matchId);
+        const playersWithScore = players.map(p => ({ ...p, score: 0 }));
+        return _buildSimpleState(matchId, null, playersWithScore, 0, {
+            current_round: 1,
+        });
+    }
+
+    async function bermudaThrow(matchId, data) {
+        return { ok: true };
+    }
+
+    async function bermudaNext(matchId, data) {
+        const playerRows = await _getSimplePlayers(matchId);
+        const currentIndex = data ? (data.current_player_index || 0) : 0;
+        const nextIndex = (currentIndex + 1) % playerRows.length;
+        const playersWithScore = playerRows.map((p, i) => ({
+            ...p,
+            score: (data && data.player_scores && data.player_scores[i]) || 0,
+        }));
+        return _buildSimpleState(matchId, null, playersWithScore, nextIndex, {
+            current_round: data ? (data.current_round || 1) : 1,
+            events:        [],
+        });
+    }
+
+    async function restartBermudaMatch(matchId) {
+        const players = await _getSimplePlayers(matchId);
+        return createBermudaMatch({ player_ids: players.map(p => p.id) });
+    }
+
+    async function endBermudaMatch(matchId) {
+        return _endSimpleMatch(matchId);
+    }
+
+    // ------------------------------------------------------------------
+    // Baseball
+    // ------------------------------------------------------------------
+
+    async function createBaseballMatch(config) {
+        const { matchId } = await _createSimpleMatch('Baseball', config, null);
+        const players = await _getSimplePlayers(matchId);
+
+        // Random start number 1-11
+        const startNumber = Math.floor(Math.random() * 11) + 1;
+
+        // Build innings structure: { playerId: { 1: {runs,outs,darts,complete}, ... } }
+        const innings = {};
+        const totalRuns = {};
+        for (const p of players) {
+            innings[String(p.id)] = {};
+            totalRuns[String(p.id)] = 0;
+        }
+
+        return _buildSimpleState(matchId, null, players, 0, {
+            game_id:              matchId,
+            start_number:         startNumber,
+            current_inning:       1,
+            innings:              innings,
+            total_runs:           totalRuns,
+            current_throws:       [],
+            darts_in_set:         0,
+            high_score_results:   null,
+            winner_ids:           null,
+        });
+    }
+
+    async function recordBaseballThrow(matchId, data) {
+        return { ok: true };
+    }
+
+    async function baseballNext(matchId, data) {
+        const playerRows = await _getSimplePlayers(matchId);
+        const currentIndex = data ? (data.current_player_index || 0) : 0;
+        const nextIndex = (currentIndex + 1) % playerRows.length;
+        return _buildSimpleState(matchId, matchId, playerRows, nextIndex, {
+            start_number:       data ? (data.start_number || 1) : 1,
+            current_inning:     data ? (data.current_inning || 1) : 1,
+            innings:            data ? (data.innings || {}) : {},
+            total_runs:         data ? (data.total_runs || {}) : {},
+            current_throws:     [],
+            darts_in_set:       0,
+            winner_ids:         data ? (data.winner_ids || null) : null,
+            high_score_results: null,
+        });
+    }
+
+    async function restartBaseballMatch(matchId) {
+        const players = await _getSimplePlayers(matchId);
+        return createBaseballMatch({ player_ids: players.map(p => p.id) });
+    }
+
+    async function endBaseballMatch(matchId) {
+        return _endSimpleMatch(matchId);
+    }
+
+    // ------------------------------------------------------------------
+    // Practice
+    // ------------------------------------------------------------------
+
+    async function startPracticeSession(config) {
+        const db = window._db;
+
+        // Create a practice match record
+        const matchResult = await db.run(
+            `INSERT INTO matches (game_type, status, legs_to_win)
+             VALUES ('Practice', 'active', 1)`
+        );
+        const matchId = matchResult.changes.lastId;
+
+        // Link player to match
+        await db.run(
+            `INSERT INTO match_players (match_id, player_id, position)
+             VALUES (?, ?, 0)`,
+            [matchId, config.player_id]
+        );
+
+        // Create a practice session record
+        await db.run(
+            `INSERT INTO practice_sessions (player_id, mode)
+             VALUES (?, 'free')`,
+            [config.player_id]
+        );
+
+        // Create a leg
+        const legResult = await db.run(
+            `INSERT INTO legs (match_id, leg_number, starting_score)
+             VALUES (?, 1, 0)`,
+            [matchId]
+        );
+        const legId = legResult.changes.lastId;
+
+        // Create an initial turn
+        const turnResult = await db.run(
+            `INSERT INTO turns (leg_id, player_id, turn_number, score, remaining, is_bust)
+             VALUES (?, ?, 1, 0, 0, 0)`,
+            [legId, config.player_id]
+        );
+        const turnId = turnResult.changes.lastId;
+
+        return {
+            match_id: matchId,
+            leg_id:   legId,
+            turn_id:  turnId,
+        };
+    }
+
+    async function endPracticeSession(matchId) {
+        const db = window._db;
+        await db.run(
+            `UPDATE matches SET status = 'complete',
+             completed_at = datetime('now') WHERE id = ?`,
+            [matchId]
+        );
+        return { ok: true };
+    }
+
+    async function recordPracticeThrow(data) {
+        const db = window._db;
+        await db.run(
+            `INSERT INTO practice_throws
+             (session_id, player_id, segment, multiplier, score, throw_order)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            [data.session_id || 1, data.player_id, data.segment,
+             data.multiplier, data.score, data.throw_order || 1]
+        );
+        return { ok: true };
+    }
+
+    // ------------------------------------------------------------------
     // Public interface
     // ------------------------------------------------------------------
 
@@ -863,6 +1327,34 @@ const API = (() => {
         submitShanghaiRound,
         restartShanghaiMatch,
         endShanghaiMatch,
+        createRace1000Match,
+        race1000Throw,
+        race1000Next,
+        restartRace1000Match,
+        endRace1000Match,
+        createNineLivesMatch,
+        nineLivesThrow,
+        nineLivesNext,
+        restartNineLivesMatch,
+        endNineLivesMatch,
+        createKillerMatch,
+        killerThrow,
+        killerNext,
+        restartKillerMatch,
+        endKillerMatch,
+        createBermudaMatch,
+        bermudaThrow,
+        bermudaNext,
+        restartBermudaMatch,
+        endBermudaMatch,
+        createBaseballMatch,
+        recordBaseballThrow,
+        baseballNext,
+        restartBaseballMatch,
+        endBaseballMatch,
+        startPracticeSession,
+        endPracticeSession,
+        recordPracticeThrow,
     };
 
 })();

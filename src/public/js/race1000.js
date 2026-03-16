@@ -7,6 +7,10 @@
  *   RACE1000_GAME.start(config, onEnd)
  *     config: { players: [{id,name}|{mode:'new',name}], variant: 'twenties'|'all' }
  *     onEnd:  called when game ends or is abandoned
+ *
+ * MIGRATION NOTES:
+ *   - _onThrow now updates ring score immediately on each dart
+ *   - _onNext captures turn score before API call so _speakTurnEnd gets correct value
  */
 
 var RACE1000_GAME = (function () {
@@ -30,7 +34,7 @@ var RACE1000_GAME = (function () {
         multiplier:         1,
         setComplete:        false,
         turnNumber:         1,
-        targetSet:          false,   // someone reached 1000 this round but round not over
+        targetSet:          false,
         cpuDifficulty:      'medium',
         cpuTurnRunning:     false,
         cpuPlayerId:        null,
@@ -79,7 +83,6 @@ var RACE1000_GAME = (function () {
                 _applyState(s);
                 _state.onEnd = onEnd;
                 UI.setLoading(false);
-                // Propagate isCpu flag from resolved players into state
                 _resolvedPlayers.forEach(function (p) {
                     if (p.isCpu) {
                         var sp = _state.players.find(function (x) { return String(x.id) === String(p.id); });
@@ -94,7 +97,6 @@ var RACE1000_GAME = (function () {
                 }
                 setTimeout(function () {
                     if (_isCpuPlayer(_currentPlayer())) {
-                        // _runCpuTurn calls _announcePlayer internally and waits for it
                         _runCpuTurn();
                     } else {
                         _announcePlayer(true);
@@ -112,7 +114,6 @@ var RACE1000_GAME = (function () {
     function _resolvePlayers(selections) {
         return Promise.all(selections.map(function (sel) {
             if (sel.isCpu) {
-                // Use dedicated getCpuPlayer — finds existing record without risking 409
                 return API.getCpuPlayer()
                     .catch(function () { return null; })
                     .then(function (rec) {
@@ -162,7 +163,7 @@ var RACE1000_GAME = (function () {
         return _state.players.find(function (p) { return String(p.id) === String(id); }) || null;
     }
 
-    // ── Score dart locally (mirrors backend) ──────────────────────────────────
+    // ── Score dart locally ────────────────────────────────────────────────────
 
     function _scoreDart(segment, multiplier) {
         if (segment === 0) return 0;
@@ -187,7 +188,6 @@ var RACE1000_GAME = (function () {
         app.style.cssText = '';
         document.body.className = 'mode-race1000';
 
-        // ── Header ────────────────────────────────────────────────────────────
         var header = document.createElement('div');
         header.className = 'game-header';
 
@@ -251,31 +251,26 @@ var RACE1000_GAME = (function () {
         header.appendChild(rightSlot);
         app.appendChild(header);
 
-        // ── Sidebar — player cards with SVG rings ─────────────────────────────
         var sidebar = document.createElement('aside');
         sidebar.id = 'r1k-sidebar';
         sidebar.className = 'r1k-sidebar';
         _renderCards(sidebar);
         app.appendChild(sidebar);
 
-        // ── Board (right column) ──────────────────────────────────────────────
         var board = document.createElement('main');
         board.id = 'r1k-seg-board';
         board.className = 'r1k-seg-board';
 
-        // Status banner
         var statusEl = document.createElement('div');
         statusEl.id = 'r1k-status';
         statusEl.className = 'r1k-status-banner';
         board.appendChild(statusEl);
 
-        // Dart pills
         var pills = document.createElement('div');
         pills.id = 'r1k-pills';
         pills.className = 'r1k-pills';
         board.appendChild(pills);
 
-        // Multiplier tabs
         _state.multiplier = 1;
         var tabs = document.createElement('div');
         tabs.id = 'r1k-tabs';
@@ -304,11 +299,9 @@ var RACE1000_GAME = (function () {
         document.body.dataset.multiplier = 1;
         board.appendChild(tabs);
 
-        // Segment grid + bull row
         board.appendChild(_buildGrid());
         board.appendChild(_buildBullRow());
 
-        // Footer hint
         var footer = document.createElement('footer');
         footer.className = 'r1k-footer';
         var footerMsg = document.createElement('span');
@@ -322,9 +315,7 @@ var RACE1000_GAME = (function () {
         _applyHighlights();
     }
 
-    // ── Progress bars ─────────────────────────────────────────────────────────
-
-    // ── Leader detection ─────────────────────────────────────────────────────
+    // ── Leader detection ──────────────────────────────────────────────────────
 
     function _leaderId() {
         var maxScore = -1;
@@ -337,7 +328,6 @@ var RACE1000_GAME = (function () {
         return (maxScore === 0 || tied) ? null : leader;
     }
 
-    // Returns 'leader' or 'trailing' — drives ring colour
     function _ringRole(playerId) {
         var lid = _leaderId();
         return (lid !== null && String(playerId) === String(lid)) ? 'leader' : 'trailing';
@@ -356,13 +346,11 @@ var RACE1000_GAME = (function () {
             card.id        = 'r1k-card-' + p.id;
             card.className = 'r1k-player-card' + (isActive ? ' r1k-active' : '') + ' r1k-ring-' + role;
 
-            // Name
             var nameEl = document.createElement('div');
             nameEl.className = 'r1k-player-name';
             nameEl.textContent = p.name.toUpperCase();
             card.appendChild(nameEl);
 
-            // SVG progress ring
             var svg = document.createElementNS(ns, 'svg');
             svg.setAttribute('viewBox', '0 0 128 128');
             svg.setAttribute('class', 'r1k-ring-svg');
@@ -381,14 +369,12 @@ var RACE1000_GAME = (function () {
             arc.setAttribute('r',  _R1K_RING_R);
             arc.setAttribute('class', 'r1k-ring-arc');
             arc.setAttribute('stroke-dasharray',  _R1K_RING_CIRC);
-            // Start at 0 progress (empty arc), fill as score rises toward 1000
             var initFraction = Math.min(1, p.score / WIN_TARGET);
             var initOffset   = +(_R1K_RING_CIRC * (1 - initFraction)).toFixed(4);
             arc.setAttribute('stroke-dashoffset', initOffset);
             arc.id = 'r1k-arc-' + p.id;
             svg.appendChild(arc);
 
-            // Score text inside ring
             var text = document.createElementNS(ns, 'text');
             text.setAttribute('x', _R1K_RING_CX);
             text.setAttribute('y', _R1K_RING_CY);
@@ -401,13 +387,11 @@ var RACE1000_GAME = (function () {
 
             card.appendChild(svg);
 
-            // Turn sub ("+X" delta shown during active turn)
             var subEl = document.createElement('div');
             subEl.id        = 'r1k-sub-' + p.id;
             subEl.className = 'r1k-player-sub';
             card.appendChild(subEl);
 
-            // "Needs N" hint
             var needEl = document.createElement('div');
             needEl.id        = 'r1k-need-' + p.id;
             needEl.className = 'r1k-player-need';
@@ -424,13 +408,11 @@ var RACE1000_GAME = (function () {
             var isActive = String(p.id) === String(_state.currentPlayerId);
             var role     = _ringRole(p.id);
 
-            // Card classes
             var card = document.getElementById('r1k-card-' + p.id);
             if (card) {
                 card.className = 'r1k-player-card' + (isActive ? ' r1k-active' : '') + ' r1k-ring-' + role;
             }
 
-            // Arc offset (counts up: more score = less offset = more arc)
             var arc = document.getElementById('r1k-arc-' + p.id);
             if (arc) {
                 var fraction = Math.min(1, p.score / WIN_TARGET);
@@ -438,11 +420,9 @@ var RACE1000_GAME = (function () {
                 arc.setAttribute('stroke-dashoffset', offset);
             }
 
-            // Score text
             var scoreEl = document.getElementById('r1k-score-' + p.id);
             if (scoreEl) scoreEl.textContent = p.score;
 
-            // Needs hint
             var needEl = document.getElementById('r1k-need-' + p.id);
             if (needEl) {
                 var need = Math.max(0, WIN_TARGET - p.score);
@@ -451,7 +431,6 @@ var RACE1000_GAME = (function () {
         });
     }
 
-    // Keep _updateBoard as alias so _onNext call still works
     function _updateBoard() { _updateCards(); }
 
     function _updateTurnSub() {
@@ -467,6 +446,29 @@ var RACE1000_GAME = (function () {
                 subEl.className   = 'r1k-player-sub';
             }
         });
+    }
+
+    // Update the ring for the current player immediately during a turn
+    function _updateCurrentPlayerRing() {
+        var cp = _currentPlayer();
+        if (!cp) return;
+        var running = (cp.score || 0) + _turnTotal();
+
+        var scoreEl = document.getElementById('r1k-score-' + cp.id);
+        if (scoreEl) scoreEl.textContent = running;
+
+        var arc = document.getElementById('r1k-arc-' + cp.id);
+        if (arc) {
+            var frac   = Math.min(1, running / WIN_TARGET);
+            var offset = +(_R1K_RING_CIRC * (1 - frac)).toFixed(4);
+            arc.setAttribute('stroke-dashoffset', offset);
+        }
+
+        var needEl = document.getElementById('r1k-need-' + cp.id);
+        if (needEl) {
+            var need = Math.max(0, WIN_TARGET - running);
+            needEl.textContent = need > 0 ? 'NEEDS ' + need : 'DONE!';
+        }
     }
 
     function _updateStatus() {
@@ -522,7 +524,6 @@ var RACE1000_GAME = (function () {
     }
 
     function _applyHighlights() {
-        // In twenties variant, highlight the 20 button; all numbers variant — no highlight
         document.querySelectorAll('#r1k-seg-board .seg-btn[data-segment]').forEach(function (btn) {
             btn.classList.remove('target-highlight');
             if (_state.variant === 'twenties' && parseInt(btn.dataset.segment) === 20) {
@@ -542,7 +543,6 @@ var RACE1000_GAME = (function () {
 
     function _onThrow(segment, multiplier) {
         if (_state.setComplete || _state.status !== 'active') return;
-        // Block human input during CPU turn (CPU calls _onThrow directly)
         if (_state.cpuTurnRunning && !_isCpuPlayer(_currentPlayer())) return;
         if (_pendingThrows.length >= 3) return;
 
@@ -555,7 +555,10 @@ var RACE1000_GAME = (function () {
 
         _addPill(segment, multiplier, pts);
         var dartDuration = _speakDart(segment, multiplier, pts);
+
+        // Update sub-label and ring immediately after each dart
         _updateTurnSub();
+        _updateCurrentPlayerRing();
 
         var ub = document.getElementById('r1k-undo-btn');
         if (ub) ub.disabled = false;
@@ -575,13 +578,25 @@ var RACE1000_GAME = (function () {
         var throws   = _pendingThrows.slice();
         var turnNum  = _state.turnNumber;
 
+        // Capture turn score NOW before _clearTurn wipes pendingThrows
+        var capturedTurnScore = throws.reduce(function (sum, t) { return sum + (t.points || 0); }, 0);
+
         var submitPromise = throws.length > 0
             ? API.race1000Throw(_state.matchId, { throws: throws, turn_number: turnNum })
             : Promise.resolve(null);
 
         submitPromise
             .then(function () {
-                return API.race1000Next(_state.matchId, { turn_number: turnNum });
+                return API.race1000Next(_state.matchId, {
+                    turn_number:          turnNum,
+                    current_player_index: _state.currentPlayerIndex,
+                    variant:              _state.variant,
+                    turn_score:           capturedTurnScore,
+                    players:              _state.players.map(function (p) {
+                        var extra = (String(p.id) === String(_state.currentPlayerId)) ? capturedTurnScore : 0;
+                        return { id: p.id, score: (p.score || 0) + extra };
+                    }),
+                });
             })
             .then(function (s) {
                 var events = s.events || [];
@@ -589,10 +604,8 @@ var RACE1000_GAME = (function () {
                 UI.setLoading(false);
                 _clearTurn();
 
-                // Increment local turn counter when round wraps
                 var scoredEv = events.find(function (e) { return e.type === 'scored'; });
                 if (scoredEv) {
-                    // Update the specific player score in _state.players for immediate UI
                     var pl = _playerById(scoredEv.player_id);
                     if (pl) pl.score = scoredEv.new_score;
                 }
@@ -601,14 +614,18 @@ var RACE1000_GAME = (function () {
                 _updateCards();
                 _updateStatus();
 
-                var winnerEv   = events.find(function (e) { return e.type === 'winner'; });
+                var winnerEv    = events.find(function (e) { return e.type === 'winner'; });
                 var targetSetEv = events.find(function (e) { return e.type === 'target_set'; });
 
                 if (winnerEv) {
-                    var winnerPl = _playerById(winnerEv.player_id);
-                    var delay    = 400;
-                    if (scoredEv) {
-                        delay = _speakTurnEnd(scoredEv, true);
+                    var delay = 400;
+                    if (capturedTurnScore > 0) {
+                        var winEv = Object.assign({}, scoredEv || {}, {
+                            player_id:   _state.winnerId || (scoredEv && scoredEv.player_id),
+                            turn_points: capturedTurnScore,
+                            new_score:   scoredEv ? scoredEv.new_score : capturedTurnScore,
+                        });
+                        delay = _speakTurnEnd(winEv, true);
                     }
                     setTimeout(function () { _showResult(winnerEv); }, delay);
                     return;
@@ -616,7 +633,6 @@ var RACE1000_GAME = (function () {
 
                 _state.turnNumber++;
 
-                // Announce target set (player reached 1000 but others still to throw)
                 var afterDelay = 400;
                 if (targetSetEv) {
                     var tsPl = _playerById(targetSetEv.player_id);
@@ -624,18 +640,22 @@ var RACE1000_GAME = (function () {
                         var tsMsg = tsPl.name + ' has set the target at ' + targetSetEv.score +
                                     '! Others still to throw.';
                         setTimeout(function () {
-                            window.speechSynthesis && window.speechSynthesis.cancel();
                             SPEECH.speak(tsMsg, { rate: 1.0, pitch: 1.0 });
                         }, afterDelay);
                         afterDelay += 600 + tsMsg.length * 75;
                     }
-                } else if (scoredEv) {
-                    afterDelay = _speakTurnEnd(scoredEv, false);
+                } else if (scoredEv || capturedTurnScore >= 0) {
+                    // Build a speech event with the correct turn delta
+                    var speakEv = Object.assign({}, scoredEv || {}, {
+                        player_id:   (scoredEv && scoredEv.player_id) || _state.currentPlayerId,
+                        turn_points: capturedTurnScore,
+                        new_score:   scoredEv ? scoredEv.new_score : 0,
+                    });
+                    afterDelay = _speakTurnEnd(speakEv, false);
                 }
 
                 setTimeout(function () {
                     if (_isCpuPlayer(_currentPlayer())) {
-                        // _runCpuTurn calls _announcePlayer internally and waits for it
                         _runCpuTurn();
                     } else {
                         _announcePlayer(false);
@@ -666,7 +686,6 @@ var RACE1000_GAME = (function () {
             }
             var dart = _cpuChooseDart();
             dartsThrown++;
-            // Speak the dart and wait for it to finish before throwing the next one
             var speechDur = _speakDart(dart.segment, dart.multiplier, 0);
             _onThrow(dart.segment, dart.multiplier);
             var nextDelay = Math.max(1000, speechDur + 450);
@@ -677,7 +696,6 @@ var RACE1000_GAME = (function () {
         var nb = document.getElementById('r1k-next-btn'); if (nb) nb.disabled = true;
         var ub = document.getElementById('r1k-undo-btn'); if (ub) ub.disabled = true;
 
-        // Wait for "CPU's turn to throw" announcement to finish before first dart
         var announceWait = _announcePlayer(false);
         setTimeout(_throwNext, Math.max(1000, announceWait + 400));
     }
@@ -695,18 +713,15 @@ var RACE1000_GAME = (function () {
 
         if (_state.variant === 'twenties') {
             if (diff === 'hard') {
-                // Hard (was Medium): T20 60%, D20 20%, S20 20%
                 if (r < 0.60) return { segment: 20, multiplier: 3 };
                 if (r < 0.80) return { segment: 20, multiplier: 2 };
                 return { segment: 20, multiplier: 1 };
             } else if (diff === 'medium') {
-                // Medium (was Easy): T20 35%, D20 25%, S20 25%, brain fade 15%
                 if (r < 0.35) return { segment: 20, multiplier: 3 };
                 if (r < 0.60) return { segment: 20, multiplier: 2 };
                 if (r < 0.85) return { segment: 20, multiplier: 1 };
                 return { segment: BOARD_RING[Math.floor(Math.random() * BOARD_RING.length)], multiplier: 1 };
             } else {
-                // Easy (new): T20 <5%, D20 <10%, lots of S20/S1/S5, regular brain fades
                 if (r < 0.04) return { segment: 20, multiplier: 3 };
                 if (r < 0.12) return { segment: 20, multiplier: 2 };
                 if (r < 0.35) return { segment: 20, multiplier: 1 };
@@ -715,19 +730,15 @@ var RACE1000_GAME = (function () {
                 return { segment: BOARD_RING[Math.floor(Math.random() * BOARD_RING.length)], multiplier: 1 };
             }
         } else {
-            // All-numbers variant
             if (diff === 'hard') {
-                // Hard: mostly T20, occasional T19
                 if (r < 0.85) return { segment: 20, multiplier: 3 };
                 return { segment: 19, multiplier: 3 };
             } else if (diff === 'medium') {
-                // Medium: mix of T20, D20, S20 with some brain fades
                 if (r < 0.35) return { segment: 20, multiplier: 3 };
                 if (r < 0.60) return { segment: 20, multiplier: 2 };
                 if (r < 0.80) return { segment: 20, multiplier: 1 };
                 return { segment: BOARD_RING[Math.floor(Math.random() * BOARD_RING.length)], multiplier: 1 };
             } else {
-                // Easy: T20 <5%, D20 <10%, mainly singles, lots of S1/S5, regular brain fades
                 if (r < 0.04) return { segment: 20, multiplier: 3 };
                 if (r < 0.12) return { segment: 20, multiplier: 2 };
                 if (r < 0.30) return { segment: 20, multiplier: 1 };
@@ -822,9 +833,10 @@ var RACE1000_GAME = (function () {
         if (ub) ub.disabled = (_throwHistory.length === 0);
 
         _updateTurnSub();
+        _updateCurrentPlayerRing();
     }
 
-    // ── End ───────────────────────────────────────────────────────────────────
+    // ── End / Restart ─────────────────────────────────────────────────────────
 
     function _onRestart() {
         UI.showConfirmModal({
@@ -843,7 +855,7 @@ var RACE1000_GAME = (function () {
                 _applyState(state);
                 _buildScreen();
                 UI.showToast('MATCH RESTARTED', 'info', 2000);
-                var startDelay = _announceCurrentPlayer(true);
+                var startDelay = _announcePlayer(true);
                 if (_isCpuPlayer(_currentPlayer())) {
                     setTimeout(_runCpuTurn, startDelay + 400);
                 }
@@ -889,7 +901,6 @@ var RACE1000_GAME = (function () {
             (_state.variant === 'twenties' ? '20s ONLY' : 'ALL NUMBERS') + '</div>' +
             '</div>';
 
-        // Standings table
         var table = document.createElement('div');
         table.className = 'r1k-result-table';
 
@@ -921,7 +932,6 @@ var RACE1000_GAME = (function () {
         if (SPEECH.isEnabled()) {
             setTimeout(function () {
                 var msg = winName + ' wins the race to one thousand! Well played.';
-                window.speechSynthesis && window.speechSynthesis.cancel();
                 SPEECH.speak(msg, { rate: 1.0, pitch: 1.0 });
             }, 800);
         }
@@ -945,7 +955,6 @@ var RACE1000_GAME = (function () {
     // ── Speech ────────────────────────────────────────────────────────────────
 
     function _announcePlayer(isFirst) {
-        // Returns estimated ms until speech is finished (delay + speaking time)
         if (!SPEECH.isEnabled()) return 0;
         var p = _currentPlayer();
         if (!p) return 0;
@@ -953,14 +962,12 @@ var RACE1000_GAME = (function () {
         var delay = isFirst ? 700 : 500;
         var dur   = delay + 200 + msg.length * 120;
         setTimeout(function () {
-            window.speechSynthesis && window.speechSynthesis.cancel();
             SPEECH.speak(msg, { rate: 1.0, pitch: 1.0 });
         }, delay);
         return dur;
     }
 
     function _speakDart(segment, multiplier, points) {
-        // Returns estimated speech duration in ms
         if (!SPEECH.isEnabled()) return 0;
         var label;
         if (segment === 0) {
@@ -971,22 +978,10 @@ var RACE1000_GAME = (function () {
             var mulLabel = multiplier === 3 ? 'Treble ' : multiplier === 2 ? 'Double ' : '';
             label = mulLabel + segment;
         }
-        window.speechSynthesis && window.speechSynthesis.cancel();
         SPEECH.speak(label, { rate: 1.0, pitch: 1.0 });
         return 300 + label.length * 120;
     }
 
-    function _speakTurnSummary() {
-        if (!SPEECH.isEnabled()) return;
-        var total = _turnTotal();
-        var msg   = total > 0 ? total + ' this turn.' : 'No score this turn.';
-        setTimeout(function () {
-            window.speechSynthesis && window.speechSynthesis.cancel();
-            SPEECH.speak(msg, { rate: 1.0, pitch: 1.0 });
-        }, 600);
-    }
-
-    // Speak "X this turn. Total: Y." Returns ms to wait before chaining.
     function _speakTurnEnd(scoredEv, isFinal) {
         if (!SPEECH.isEnabled()) return 400;
         var p   = _playerById(scoredEv.player_id);
@@ -995,7 +990,6 @@ var RACE1000_GAME = (function () {
             : 'No score this turn. ') +
             (p ? p.name + "'s total is " + scoredEv.new_score + '.' : '');
         setTimeout(function () {
-            window.speechSynthesis && window.speechSynthesis.cancel();
             SPEECH.speak(msg, { rate: 1.0, pitch: 1.0 });
         }, 300);
         return 300 + 2600 + msg.length * 95;
