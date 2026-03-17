@@ -98,21 +98,8 @@ const STATS = (() => {
         title.className = 'stats-header-title';
         title.textContent = player.name.toUpperCase();
 
-        const aiBtn = document.createElement('button');
-        aiBtn.className = 'stats-ai-btn';
-        aiBtn.type = 'button';
-        aiBtn.textContent = '🤖 AI ANALYSIS';
-        aiBtn.addEventListener('click', function() {
-            if (typeof ANALYSIS !== 'undefined') {
-                ANALYSIS.showAnalysisScreen(player, function() {
-                    STATS.showStatsScreen(player, onBack);
-                });
-            }
-        });
-
         header.appendChild(backBtn);
         header.appendChild(title);
-        header.appendChild(aiBtn);
         app.appendChild(header);
 
         // ---- Scope filters ----

@@ -1411,6 +1411,660 @@ const API = (() => {
     // Public interface
     // ------------------------------------------------------------------
 
+
+    // ─────────────────────────────────────────────────────────────────
+    // Stats API
+    // ─────────────────────────────────────────────────────────────────
+
+    async function getPlayerStats(playerId, filters) {
+        const db = window._db;
+
+        // ── Records ──────────────────────────────────────────────────
+        // Matches played/won (all game types)
+        const matchRes = await db.query(`
+            SELECT
+                COUNT(DISTINCT m.id) AS matches_played,
+                SUM(CASE WHEN mp.is_winner = 1 THEN 1 ELSE 0 END) AS matches_won
+            FROM match_players mp
+            JOIN matches m ON m.id = mp.match_id
+            WHERE mp.player_id = ?
+              AND m.status IN ('complete','completed')
+        `, [playerId]);
+        const mr = (matchRes.values || [])[0] || {};
+
+        // Legs played/won (x01 only)
+        const legRes = await db.query(`
+            SELECT
+                COUNT(DISTINCT l.id) AS legs_played,
+                SUM(CASE WHEN l.winner_id = ? THEN 1 ELSE 0 END) AS legs_won
+            FROM legs l
+            JOIN matches m ON m.id = l.match_id
+            JOIN match_players mp ON mp.match_id = m.id AND mp.player_id = ?
+            WHERE l.completed_at IS NOT NULL
+              AND m.game_type IN ('501','201')
+        `, [playerId, playerId]);
+        const lr = (legRes.values || [])[0] || {};
+
+        // Sets won (x01)
+        const setsRes = await db.query(`
+            SELECT COUNT(DISTINCT m.id) AS sets_won
+            FROM matches m
+            JOIN match_players mp ON mp.match_id = m.id
+            WHERE mp.player_id = ?
+              AND mp.is_winner = 1
+              AND m.game_type IN ('501','201')
+              AND m.status IN ('complete','completed')
+        `, [playerId]);
+        const sr = (setsRes.values || [])[0] || {};
+
+        const matchesPlayed = mr.matches_played || 0;
+        const matchesWon    = mr.matches_won    || 0;
+        const legsPlayed    = lr.legs_played    || 0;
+        const legsWon       = lr.legs_won       || 0;
+        const matchWinRate  = matchesPlayed > 0 ? Math.round(matchesWon / matchesPlayed * 100) : 0;
+        const legWinRate    = legsPlayed    > 0 ? Math.round(legsWon    / legsPlayed    * 100) : 0;
+
+        // ── Scoring (x01 turns) ───────────────────────────────────────
+        const turnRes = await db.query(`
+            SELECT
+                COUNT(*) AS total_turns,
+                SUM(t.score) AS total_scored,
+                MAX(t.score) AS highest_turn,
+                MIN(CASE WHEN t.score > 0 AND t.is_bust = 0 THEN t.score ELSE NULL END) AS lowest_turn,
+                SUM(t.is_bust) AS busts,
+                SUM(CASE WHEN t.score >= 180 THEN 1 ELSE 0 END) AS one_eighties,
+                SUM(CASE WHEN t.score >= 140 AND t.score < 180 THEN 1 ELSE 0 END) AS ton_forties,
+                SUM(CASE WHEN t.score >= 100 AND t.score < 140 THEN 1 ELSE 0 END) AS tons
+            FROM turns t
+            JOIN legs l ON l.id = t.leg_id
+            JOIN matches m ON m.id = l.match_id
+            WHERE t.player_id = ?
+              AND m.game_type IN ('501','201')
+              AND t.is_bust = 0
+        `, [playerId]);
+        const tr = (turnRes.values || [])[0] || {};
+
+        // First 9 darts average
+        const first9Res = await db.query(`
+            SELECT AVG(sub.first9) AS first9_avg FROM (
+                SELECT l.id AS lid, t.player_id,
+                    SUM(CASE WHEN t.turn_number <= 3 THEN t.score ELSE 0 END) AS first9
+                FROM turns t
+                JOIN legs l ON l.id = t.leg_id
+                JOIN matches m ON m.id = l.match_id
+                WHERE t.player_id = ?
+                  AND m.game_type IN ('501','201')
+                  AND t.is_bust = 0
+                GROUP BY l.id
+            ) sub
+        `, [playerId]);
+        const f9r = (first9Res.values || [])[0] || {};
+
+        // Total darts thrown (x01)
+        const dartRes = await db.query(`
+            SELECT COUNT(*) AS total_darts, MAX(th.score) AS highest_dart
+            FROM throws th
+            JOIN turns t ON t.id = th.turn_id
+            JOIN legs l ON l.id = t.leg_id
+            JOIN matches m ON m.id = l.match_id
+            WHERE th.player_id = ?
+              AND m.game_type IN ('501','201')
+        `, [playerId]);
+        const dr = (dartRes.values || [])[0] || {};
+
+        const totalDarts   = dr.total_darts || 0;
+        const totalScored  = tr.total_scored || 0;
+        const threeDartAvg = totalDarts > 0 ? (totalScored / totalDarts * 3).toFixed(1) : '—';
+        const first9Avg    = f9r.first9_avg != null ? parseFloat(f9r.first9_avg).toFixed(1) : '—';
+
+        // ── Checkout stats (x01) ──────────────────────────────────────
+        // Find checkout turns (remaining = 0 after turn, not a bust)
+        // remaining = 0 and is_bust = 0 means checkout; score = the finishing score (e.g. 32 for D16)
+        const coRes = await db.query(`
+            SELECT
+                MAX(t.score) AS best_checkout,
+                AVG(dc.darts) AS avg_darts_to_checkout,
+                COUNT(*) AS checkout_count
+            FROM turns t
+            JOIN legs l ON l.id = t.leg_id
+            JOIN matches m ON m.id = l.match_id
+            JOIN (SELECT turn_id, COUNT(*) AS darts FROM throws GROUP BY turn_id) dc ON dc.turn_id = t.id
+            WHERE t.player_id = ?
+              AND t.remaining = 0
+              AND t.is_bust = 0
+              AND m.game_type IN ('501','201')
+        `, [playerId]);
+        const cor = (coRes.values || [])[0] || {};
+
+        // Favourite double (most common final dart on checkout turns)
+        const favDblRes = await db.query(`
+            SELECT th.segment, th.multiplier, COUNT(*) AS cnt
+            FROM throws th
+            JOIN turns t ON t.id = th.turn_id
+            JOIN legs l ON l.id = t.leg_id
+            JOIN matches m ON m.id = l.match_id
+            WHERE th.player_id = ?
+              AND t.remaining = 0
+              AND t.is_bust = 0
+              AND th.multiplier = 2
+              AND m.game_type IN ('501','201')
+              AND th.throw_order = (
+                  SELECT MAX(th2.throw_order) FROM throws th2 WHERE th2.turn_id = th.turn_id
+              )
+            GROUP BY th.segment, th.multiplier
+            ORDER BY cnt DESC
+            LIMIT 1
+        `, [playerId]);
+        const fdr = (favDblRes.values || [])[0];
+        const favDouble = fdr ? {
+            notation: (fdr.segment === 25 ? 'BULL' : 'D' + fdr.segment),
+            times: fdr.cnt,
+        } : null;
+
+        return {
+            player: { id: playerId },
+            records: {
+                matches_played: matchesPlayed,
+                matches_won:    matchesWon,
+                match_win_rate: matchWinRate,
+                legs_played:    legsPlayed,
+                legs_won:       legsWon,
+                leg_win_rate:   legWinRate,
+                sets_won:       sr.sets_won || 0,
+                three_dart_avg: threeDartAvg,
+            },
+            scoring: {
+                three_dart_avg: threeDartAvg,
+                first9_avg:     first9Avg,
+                highest_turn:   tr.highest_turn || 0,
+                lowest_turn:    tr.lowest_turn  || '—',
+                highest_dart:   dr.highest_dart || 0,
+                total_darts:    totalDarts,
+                one_eighties:   tr.one_eighties || 0,
+                ton_forties:    tr.ton_forties  || 0,
+                tons:           tr.tons         || 0,
+                busts:          tr.busts        || 0,
+            },
+            checkout: {
+                best_checkout:          cor.best_checkout          || '—',
+                best_double_checkout:   cor.best_checkout          || '—',
+                best_single_checkout:   '—',
+                avg_darts_to_checkout:  cor.avg_darts_to_checkout
+                    ? parseFloat(cor.avg_darts_to_checkout).toFixed(1) : '—',
+                favourite_double: favDouble,
+            },
+        };
+    }
+
+    async function getPlayerHeatmap(playerId, filters) {
+        const db = window._db;
+        const matchId = filters && filters.matchId ? filters.matchId : null;
+
+        // Gather throws from x01 games and practice
+        let x01Counts = {};
+        let practiceMatchId = null;
+
+        if (matchId) {
+            // Scoped to a single match — check if it's a practice session
+            const mRes = await db.query(`SELECT game_type FROM matches WHERE id = ?`, [matchId]);
+            const mRow = (mRes.values || [])[0];
+            if (mRow && mRow.game_type === 'practice') {
+                practiceMatchId = matchId;
+            } else {
+                // x01 match
+                const throwRes = await db.query(`
+                    SELECT th.segment, th.multiplier, COUNT(*) AS cnt
+                    FROM throws th
+                    JOIN turns t ON t.id = th.turn_id
+                    JOIN legs l ON l.id = t.leg_id
+                    WHERE l.match_id = ? AND th.player_id = ?
+                    GROUP BY th.segment, th.multiplier
+                `, [matchId, playerId]);
+                (throwRes.values || []).forEach(function(r) {
+                    const key = _heatmapKey(r.segment, r.multiplier);
+                    if (key) x01Counts[key] = (x01Counts[key] || 0) + r.cnt;
+                });
+            }
+        } else {
+            // All x01 throws
+            const throwRes = await db.query(`
+                SELECT th.segment, th.multiplier, COUNT(*) AS cnt
+                FROM throws th
+                JOIN turns t ON t.id = th.turn_id
+                JOIN legs l ON l.id = t.leg_id
+                JOIN matches m ON m.id = l.match_id
+                WHERE th.player_id = ?
+                  AND m.game_type IN ('501','201')
+                GROUP BY th.segment, th.multiplier
+            `, [playerId]);
+            (throwRes.values || []).forEach(function(r) {
+                const key = _heatmapKey(r.segment, r.multiplier);
+                if (key) x01Counts[key] = (x01Counts[key] || 0) + r.cnt;
+            });
+
+            // All practice throws
+            const practiceRes = await db.query(`
+                SELECT pt.segment, pt.multiplier, COUNT(*) AS cnt
+                FROM practice_throws pt
+                WHERE pt.player_id = ?
+                GROUP BY pt.segment, pt.multiplier
+            `, [playerId]);
+            (practiceRes.values || []).forEach(function(r) {
+                const key = _heatmapKey(r.segment, r.multiplier);
+                if (key) x01Counts[key] = (x01Counts[key] || 0) + r.cnt;
+            });
+        }
+
+        if (practiceMatchId) {
+            // Get practice session id from match
+            const sessRes = await db.query(`
+                SELECT id FROM practice_sessions
+                WHERE player_id = ?
+                ORDER BY id DESC LIMIT 1
+            `, [playerId]);
+            const sessRow = (sessRes.values || [])[0];
+            if (sessRow) {
+                const practiceRes = await db.query(`
+                    SELECT segment, multiplier, COUNT(*) AS cnt
+                    FROM practice_throws
+                    WHERE session_id = ? AND player_id = ?
+                    GROUP BY segment, multiplier
+                `, [sessRow.id, playerId]);
+                (practiceRes.values || []).forEach(function(r) {
+                    const key = _heatmapKey(r.segment, r.multiplier);
+                    if (key) x01Counts[key] = (x01Counts[key] || 0) + r.cnt;
+                });
+            }
+        }
+
+        return { counts: x01Counts };
+    }
+
+    function _heatmapKey(segment, multiplier) {
+        const seg = parseInt(segment, 10);
+        const mul = parseInt(multiplier, 10);
+        if (seg === 25) return mul === 2 ? 'BULL' : 'OUTER';
+        if (seg === 0)  return null; // miss — not tracked on heatmap
+        const prefix = mul === 3 ? 'T' : mul === 2 ? 'D' : 'S';
+        return prefix + seg;
+    }
+
+    async function getPlayerDailyTrend(playerId) {
+        const db = window._db;
+
+        // x01 throws per day
+        const x01Res = await db.query(`
+            SELECT DATE(th.created_at) AS day,
+                   COUNT(*) AS darts, SUM(th.score) AS score
+            FROM throws th
+            JOIN turns t ON t.id = th.turn_id
+            JOIN legs l ON l.id = t.leg_id
+            JOIN matches m ON m.id = l.match_id
+            WHERE th.player_id = ?
+              AND m.game_type IN ('501','201')
+              AND DATE(th.created_at) >= DATE('now', '-30 days')
+            GROUP BY day
+        `, [playerId]);
+
+        // Practice throws per day
+        const practRes = await db.query(`
+            SELECT DATE(pt.created_at) AS day,
+                   COUNT(*) AS darts, SUM(pt.score) AS score
+            FROM practice_throws pt
+            WHERE pt.player_id = ?
+              AND DATE(pt.created_at) >= DATE('now', '-30 days')
+            GROUP BY day
+        `, [playerId]);
+
+        // Merge by day
+        const byDay = {};
+        (x01Res.values || []).forEach(function(r) {
+            if (!byDay[r.day]) byDay[r.day] = { darts: 0, score: 0, sessions: 0 };
+            byDay[r.day].darts   += r.darts;
+            byDay[r.day].score   += r.score;
+            byDay[r.day].sessions += 1;
+        });
+        (practRes.values || []).forEach(function(r) {
+            if (!byDay[r.day]) byDay[r.day] = { darts: 0, score: 0, sessions: 0 };
+            byDay[r.day].darts   += r.darts;
+            byDay[r.day].score   += r.score;
+            byDay[r.day].sessions += 1;
+        });
+
+        const days = Object.keys(byDay).sort().map(function(day) {
+            const d = byDay[day];
+            return {
+                date:     day,
+                avg:      d.darts > 0 ? parseFloat((d.score / d.darts * 3).toFixed(1)) : 0,
+                darts:    d.darts,
+                sessions: d.sessions,
+            };
+        }).filter(function(d) { return d.avg > 0; });
+
+        return { days };
+    }
+
+    async function getPlayerHistory(playerId, offset, limit) {
+        const db = window._db;
+        const lim = limit || 20;
+        const off = offset || 0;
+
+        const res = await db.query(`
+            SELECT
+                m.id AS match_id,
+                m.game_type,
+                DATE(m.completed_at) AS date,
+                mp.is_winner,
+                mp2.name AS opponent,
+                m.completed_at
+            FROM matches m
+            JOIN match_players mp  ON mp.match_id  = m.id AND mp.player_id = ?
+            LEFT JOIN match_players mp_opp ON mp_opp.match_id = m.id AND mp_opp.player_id != ?
+            LEFT JOIN players mp2 ON mp2.id = mp_opp.player_id
+            WHERE m.status IN ('complete','completed','cancelled')
+            ORDER BY m.completed_at DESC
+            LIMIT ? OFFSET ?
+        `, [playerId, playerId, lim, off]);
+
+        const rows = res.values || [];
+
+        // Enrich each row with darts + avg
+        const sessions = await Promise.all(rows.map(async function(row) {
+            const gt = (row.game_type || '').toLowerCase();
+            const isPractice = gt === 'practice';
+
+            let darts = 0, avg = '—', score = null, cpuDiff = null;
+
+            if (gt === '501' || gt === '201') {
+                const turnRes = await db.query(`
+                    SELECT COUNT(th.id) AS darts, SUM(t.score) AS total_score
+                    FROM throws th
+                    JOIN turns t ON t.id = th.turn_id
+                    JOIN legs l ON l.id = t.leg_id
+                    WHERE l.match_id = ? AND th.player_id = ?
+                `, [row.match_id, playerId]);
+                const tr = (turnRes.values || [])[0] || {};
+                darts = tr.darts || 0;
+                avg   = darts > 0 ? (tr.total_score / darts * 3).toFixed(1) : '—';
+            } else if (gt === 'cricket') {
+                const dRes = await db.query(`
+                    SELECT COUNT(*) AS darts FROM cricket_throws
+                    WHERE match_id = ? AND player_id = ?
+                `, [row.match_id, playerId]);
+                darts = ((dRes.values || [])[0] || {}).darts || 0;
+            } else if (gt === 'shanghai') {
+                const dRes = await db.query(`
+                    SELECT COUNT(*) AS darts FROM shanghai_throws st
+                    JOIN shanghai_games sg ON sg.id = st.game_id
+                    WHERE sg.match_id = ? AND st.player_id = ?
+                `, [row.match_id, playerId]);
+                darts = ((dRes.values || [])[0] || {}).darts || 0;
+                const scoreRes = await db.query(`
+                    SELECT SUM(sr.score) AS total FROM shanghai_rounds sr
+                    JOIN shanghai_games sg ON sg.id = sr.game_id
+                    WHERE sg.match_id = ? AND sr.player_id = ?
+                `, [row.match_id, playerId]);
+                score = ((scoreRes.values || [])[0] || {}).total || 0;
+            }
+
+            const result = isPractice ? 'PRACTICE'
+                : row.is_winner ? 'WIN' : 'LOSS';
+
+            return {
+                match_id:   row.match_id,
+                game_type:  row.game_type,
+                date:       row.date || '—',
+                result,
+                opponent:   row.opponent || '—',
+                darts,
+                avg,
+                score,
+                is_practice: isPractice,
+                cpu_difficulty: null,
+            };
+        }));
+
+        return { sessions };
+    }
+
+    async function getMatchScorecard(matchId) {
+        const db = window._db;
+
+        const matchRes = await db.query(`SELECT * FROM matches WHERE id = ?`, [matchId]);
+        const match = (matchRes.values || [])[0];
+        if (!match) throw new Error('Match not found');
+
+        const playerRes = await db.query(`
+            SELECT p.id, p.name, mp.is_winner FROM players p
+            JOIN match_players mp ON mp.player_id = p.id
+            WHERE mp.match_id = ?
+            ORDER BY mp.position
+        `, [matchId]);
+        const players = playerRes.values || [];
+        const winnerId = (players.find(p => p.is_winner) || {}).id || null;
+
+        const legRes = await db.query(`
+            SELECT * FROM legs WHERE match_id = ? ORDER BY leg_number
+        `, [matchId]);
+        const legs = legRes.values || [];
+
+        const legsWithTurns = await Promise.all(legs.map(async function(leg) {
+            const turnRes = await db.query(`
+                SELECT t.id, t.player_id, t.turn_number, t.score, t.remaining,
+                       t.is_bust,
+                       (t.remaining + t.score) AS score_before
+                FROM turns t WHERE t.leg_id = ? ORDER BY t.turn_number, t.player_id
+            `, [leg.id]);
+            const turns = turnRes.values || [];
+
+            const turnsWithThrows = await Promise.all(turns.map(async function(turn) {
+                const throwRes = await db.query(`
+                    SELECT segment, multiplier, score,
+                           CASE WHEN ? = 0 AND score > 0 THEN 1 ELSE 0 END AS is_checkout
+                    FROM throws WHERE turn_id = ? ORDER BY throw_order
+                `, [turn.remaining, turn.id]);
+                const throwRows = throwRes.values || [];
+                return {
+                    ...turn,
+                    score_after: turn.remaining,
+                    is_checkout: turn.remaining === 0 && !turn.is_bust,
+                    throws: throwRows.map(function(th) {
+                        const mul = th.multiplier;
+                        const seg = th.segment;
+                        let notation;
+                        if (seg === 0) notation = 'MISS';
+                        else if (seg === 25) notation = mul === 2 ? 'BULL' : 'OUTER';
+                        else notation = (mul === 3 ? 'T' : mul === 2 ? 'D' : '') + seg;
+                        return { notation, score: th.score, is_checkout: !!(th.is_checkout) };
+                    }),
+                };
+            }));
+
+            return { ...leg, turns: turnsWithThrows };
+        }));
+
+        return {
+            match: { ...match, winner_id: winnerId },
+            players,
+            legs: legsWithTurns,
+        };
+    }
+
+    async function getGenericScorecard(matchId) {
+        const db = window._db;
+
+        const matchRes = await db.query(`SELECT * FROM matches WHERE id = ?`, [matchId]);
+        const match = (matchRes.values || [])[0];
+        if (!match) throw new Error('Match not found');
+
+        const gt = (match.game_type || '').toLowerCase();
+
+        const playerRes = await db.query(`
+            SELECT p.id, p.name, mp.is_winner FROM players p
+            JOIN match_players mp ON mp.player_id = p.id
+            WHERE mp.match_id = ?
+            ORDER BY mp.position
+        `, [matchId]);
+        const players = playerRes.values || [];
+        const winnerId = (players.find(p => p.is_winner) || {}).id || null;
+
+        // For non-01 games without DB storage, return minimal data
+        return {
+            game_type:    gt,
+            match_id:     matchId,
+            players,
+            winner_id:    winnerId,
+            final_scores: {},
+            final_states: {},
+            turns:        {},
+            message:      'Detailed scorecard data is not stored for this game type.',
+        };
+    }
+
+    async function getShanghaiScorecard(matchId) {
+        const db = window._db;
+
+        const matchRes = await db.query(`SELECT * FROM matches WHERE id = ?`, [matchId]);
+        const match = (matchRes.values || [])[0];
+
+        const playerRes = await db.query(`
+            SELECT p.id, p.name, mp.is_winner FROM players p
+            JOIN match_players mp ON mp.player_id = p.id
+            WHERE mp.match_id = ? ORDER BY mp.position
+        `, [matchId]);
+        const players = playerRes.values || [];
+        const winnerId = (players.find(p => p.is_winner) || {}).id || null;
+
+        const gameRes = await db.query(`SELECT * FROM shanghai_games WHERE match_id = ?`, [matchId]);
+        const game = (gameRes.values || [])[0];
+        if (!game) return { game_type: 'shanghai', players, winner_id: winnerId, rounds: {}, throws: {}, totals: {} };
+
+        const roundRes = await db.query(`
+            SELECT player_id, round, score, shanghai
+            FROM shanghai_rounds WHERE game_id = ?
+            ORDER BY round, player_id
+        `, [game.id]);
+
+        const throwRes = await db.query(`
+            SELECT player_id, round, multiplier, throw_order
+            FROM shanghai_throws WHERE game_id = ?
+            ORDER BY round, player_id, throw_order
+        `, [game.id]);
+
+        // Organise by round
+        const rounds = {};
+        const throwsByRound = {};
+        const totals = {};
+
+        (roundRes.values || []).forEach(function(r) {
+            if (!rounds[r.round]) rounds[r.round] = {};
+            rounds[r.round][String(r.player_id)] = {
+                score:    r.score,
+                shanghai: !!r.shanghai,
+                target:   r.round, // target = round number for standard Shanghai
+            };
+            if (!totals[String(r.player_id)]) totals[String(r.player_id)] = 0;
+            totals[String(r.player_id)] += r.score;
+        });
+
+        (throwRes.values || []).forEach(function(t) {
+            if (!throwsByRound[t.round]) throwsByRound[t.round] = {};
+            if (!throwsByRound[t.round][String(t.player_id)]) throwsByRound[t.round][String(t.player_id)] = [];
+            // Segment for Shanghai is the round target
+            const seg = t.round;
+            const mul = t.multiplier;
+            const pts = (mul === 3 || mul === 2 || mul === 1) ? seg * mul : 0;
+            throwsByRound[t.round][String(t.player_id)].push({ seg, mul, pts });
+        });
+
+        return {
+            game_type: 'shanghai',
+            players,
+            winner_id: winnerId,
+            rounds,
+            throws:    throwsByRound,
+            totals,
+        };
+    }
+
+    async function getCricketScorecard(matchId) {
+        const db = window._db;
+
+        const playerRes = await db.query(`
+            SELECT p.id, p.name, mp.is_winner FROM players p
+            JOIN match_players mp ON mp.player_id = p.id
+            WHERE mp.match_id = ? ORDER BY mp.position
+        `, [matchId]);
+        const players = playerRes.values || [];
+        const winnerId = (players.find(p => p.is_winner) || {}).id || null;
+
+        // Final marks
+        const marksRes = await db.query(`
+            SELECT player_id, number, marks FROM cricket_marks WHERE match_id = ?
+        `, [matchId]);
+
+        // Final scores
+        const scoresRes = await db.query(`
+            SELECT player_id, score FROM cricket_scores WHERE match_id = ?
+        `, [matchId]);
+
+        // Throws (turn-by-turn)
+        const throwRes = await db.query(`
+            SELECT player_id, number, multiplier, throw_order, created_at
+            FROM cricket_throws WHERE match_id = ?
+            ORDER BY created_at, throw_order
+        `, [matchId]);
+
+        const finalMarks = {};
+        (marksRes.values || []).forEach(function(r) {
+            if (!finalMarks[String(r.player_id)]) finalMarks[String(r.player_id)] = {};
+            finalMarks[String(r.player_id)][String(r.number)] = r.marks;
+        });
+
+        const finalScores = {};
+        (scoresRes.values || []).forEach(function(r) {
+            finalScores[String(r.player_id)] = r.score;
+        });
+
+        // Group throws into turns of 3
+        const turnsByPlayer = {};
+        (throwRes.values || []).forEach(function(r) {
+            const pid = String(r.player_id);
+            if (!turnsByPlayer[pid]) turnsByPlayer[pid] = [];
+            turnsByPlayer[pid].push(r);
+        });
+
+        // Build turns object: { turnNum: { playerId: [darts] } }
+        const turns = {};
+        players.forEach(function(p) {
+            const pid = String(p.id);
+            const playerThrows = turnsByPlayer[pid] || [];
+            // Group into sets of 3
+            for (let i = 0; i < playerThrows.length; i += 3) {
+                const tn = Math.floor(i / 3) + 1;
+                if (!turns[tn]) turns[tn] = {};
+                const slice = playerThrows.slice(i, i + 3);
+                turns[tn][pid] = slice.map(function(t) {
+                    return {
+                        seg:   t.number,
+                        mul:   t.multiplier,
+                        marks: Math.min(t.multiplier, 3),
+                        pts:   0, // scoring pts require complex cricket logic; omit for simplicity
+                    };
+                });
+            }
+        });
+
+        return {
+            game_type:    'cricket',
+            players,
+            winner_id:    winnerId,
+            final_marks:  finalMarks,
+            final_scores: finalScores,
+            turns,
+        };
+    }
+
     return {
         getPlayers,
         getCpuPlayer,
@@ -1459,6 +2113,14 @@ const API = (() => {
         startPracticeSession,
         endPracticeSession,
         recordPracticeThrow,
+        getPlayerStats,
+        getPlayerHeatmap,
+        getPlayerDailyTrend,
+        getPlayerHistory,
+        getMatchScorecard,
+        getGenericScorecard,
+        getShanghaiScorecard,
+        getCricketScorecard,
     };
 
 })();

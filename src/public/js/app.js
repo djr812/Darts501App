@@ -70,6 +70,7 @@
         return { processThrow };
     })();
 
+
     // ------------------------------------------------------------------
     // Setup
     // ------------------------------------------------------------------
@@ -78,9 +79,6 @@
         const players = [];
         for (const sel of selections) {
             if (sel.isCpu) {
-                // Resolve CPU player: try to fetch the existing record first,
-                // create it if it doesn't exist yet. This avoids the 409 conflict
-                // that occurs because GET /api/players excludes the CPU name.
                 state.cpuDifficulty = sel.difficulty || 'medium';
                 let cpuRecord = await API.getCpuPlayer().catch(() => null);
                 if (!cpuRecord) {
@@ -98,8 +96,6 @@
     }
 
     async function onStartGame(config) {
-        // Unlock iOS speech engine inside this user gesture (tap on Start Match)
-        // so the first programmatic utterance is not silently swallowed by Safari.
         SPEECH.unlock();
         if (typeof SOUNDS !== 'undefined') SOUNDS.unlock();
         UI.setLoading(true);
@@ -109,7 +105,7 @@
         state.doubleOut     = config.doubleOut;
         state.setsToWin     = config.setsToWin;
         state.legsPerSet    = config.legsPerSet;
-        state.legCount      = 0;   // reset so welcome fires on first leg of every new match
+        state.legCount      = 0;
 
         try {
             const players = await resolvePlayers(config.players);
@@ -180,14 +176,12 @@
         UI.setNextPlayerEnabled(false);
         UI.setUndoEnabled(true);
         _updateMatchInfo();
-        // Announce welcome on the very first leg of the match only
         if (state.legCount === 1) {
             SPEECH.announceWelcome(state.gameType);
         }
         _beginTurn();
     }
 
-    /** Called at the start of every turn (human or CPU). */
     function _beginTurn() {
         const player = currentPlayer();
         UI.setActivePlayer(player.id);
@@ -196,7 +190,7 @@
         if (player.isCpu) {
             UI.setStatus('CPU IS THINKING...');
             UI.setUndoEnabled(false);
-            setTimeout(_runCpuTurn, 1600);  // allow announcePlayer speech to finish
+            setTimeout(_runCpuTurn, 1600);
         } else {
             UI.setStatus(`${player.name.toUpperCase()}'S TURN — SELECT MULTIPLIER`);
             UI.setUndoEnabled(true);
@@ -209,20 +203,12 @@
     }
 
     // ------------------------------------------------------------------
-    // Core dart recording — shared by human and CPU paths
+    // Core dart recording
     // ------------------------------------------------------------------
 
-    /**
-     * Record a single dart via the API and update state + UI.
-     * Returns the raw server response (ThrowResult + optional leg info).
-     */
-    // _recordDart — LOCAL only, no server call.
-    // Scores the dart immediately using the JS engine and buffers it in
-    // state.pendingDarts. Server is only contacted on _submitPendingTurn().
     function _recordDart(segment, multiplier) {
         const player = currentPlayer();
 
-        // Capture turn start score on first dart
         if (state.dartsThisTurn === 0) {
             state.turnScoreBefore = player.score;
         }
@@ -232,7 +218,6 @@
             player.score, dartNumber, segment, multiplier, state.doubleOut
         );
 
-        // Buffer the dart
         state.pendingDarts.push({ segment, multiplier,
             points:     result.points,
             scoreAfter: result.scoreAfter,
@@ -241,7 +226,6 @@
         });
         state.dartsThisTurn++;
 
-        // Update UI immediately — no loading spinner
         UI.addDartPill(player.id, result.points, multiplier, segment);
 
         if (typeof SOUNDS !== 'undefined' && SOUNDS.isEnabled()) SOUNDS.dart();
@@ -265,7 +249,6 @@
 
         UI.setCheckoutPanel(player.score, state.doubleOut);
 
-        // Synthesise result shape expected by callers
         return {
             points:            result.points,
             score_before:      state.turnScoreBefore,
@@ -273,12 +256,10 @@
             is_bust:           result.isBust,
             is_checkout:       result.isCheckout,
             turn_complete:     result.turnComplete,
-            checkout_suggestion: null,  // will arrive from server after submit
+            checkout_suggestion: null,
         };
     }
 
-    // Submit the buffered turn to the server in one request.
-    // Called by onNextPlayer (normal end of turn) and onSegment (checkout).
     async function _submitPendingTurn() {
         if (state.pendingDarts.length === 0) return null;
         const player = currentPlayer();
@@ -301,26 +282,22 @@
         state.cpuTurnRunning = true;
 
         const cpuPlayer  = currentPlayer();
-        const suggestions = []; // populated from server responses as darts land
+        const suggestions = [];
 
         CPU.playTurn(
             cpuPlayer,
             { legId: state.legId, doubleOut: state.doubleOut, difficulty: state.cpuDifficulty },
             suggestions,
-            // onDart — CPU calls this for each throw
             async (segment, multiplier, currentScore) => {
                 const result = await _recordDart(segment, multiplier);
 
-                // Feed server's checkout suggestion back into the suggestions array
-                // so CPU.playTurn can use it for subsequent darts
                 if (result.checkout_suggestion && Array.isArray(result.checkout_suggestion)) {
-                    const dartIdx = state.dartsThisTurn; // already incremented
+                    const dartIdx = state.dartsThisTurn;
                     result.checkout_suggestion.forEach((s, i) => {
                         suggestions[dartIdx + i] = s;
                     });
                 }
 
-                // Status update during CPU turn
                 if (!result.is_bust && !result.is_checkout && !result.turn_complete) {
                     const dartsLeft = 3 - state.dartsThisTurn;
                     UI.setStatus(`CPU — ${cpuPlayer.score} REMAINING — ${dartsLeft} DART${dartsLeft !== 1 ? 'S' : ''} LEFT`);
@@ -328,16 +305,13 @@
 
                 return result;
             },
-            // onTurnEnd — called after all darts thrown
             async (lastResult) => {
                 state.cpuTurnRunning = false;
 
-                // Submit CPU's buffered darts to server
                 if (state.pendingDarts.length > 0) {
                     try {
                         const serverResult = await _submitPendingTurn();
                         state.pendingDarts = [];
-                        // Use server's authoritative leg result for checkout
                         if (lastResult && lastResult.is_checkout && serverResult) {
                             lastResult = serverResult;
                         }
@@ -348,7 +322,6 @@
                 }
 
                 if (lastResult && lastResult.is_checkout) {
-                    // CPU won the leg
                     state.legOver      = true;
                     state.turnComplete = true;
                     UI.setStatus('CPU CHECKED OUT!', 'success');
@@ -360,13 +333,11 @@
                     UI.showToast('CPU BUST!', 'bust', 1800);
                     UI.setStatus('CPU BUST!', 'bust');
                     state.turnComplete = true;
-                    // Auto-advance after pause so human can see the bust
-                    setTimeout(_advancePlayer, 2200);  // allow bust announcement to finish
+                    setTimeout(_advancePlayer, 2200);
 
                 } else {
-                    // Used 3 darts normally
                     state.turnComplete = true;
-                    setTimeout(_advancePlayer, 2000);  // allow turn-end announcement to finish
+                    setTimeout(_advancePlayer, 2000);
                 }
             }
         );
@@ -466,7 +437,6 @@
 
         const multiplier = forcedMultiplier !== null ? forcedMultiplier : state.activeMultiplier;
 
-        // _recordDart is now instant/local — no spinner needed
         const result = _recordDart(segment, multiplier);
 
         if (result.is_bust) {
@@ -478,7 +448,6 @@
             UI.setNextPlayerEnabled(true);
 
         } else if (result.is_checkout) {
-            // Checkout: submit to server now (we need leg-win resolution)
             SPEECH.announceCheckout(state.turnScoreBefore);
             state.legOver      = true;
             state.turnComplete = true;
@@ -516,12 +485,10 @@
             UI.showToast('NOTHING TO UNDO', 'info'); return;
         }
 
-        // Pop the last dart from the local buffer — no server call
         state.pendingDarts.pop();
         state.dartsThisTurn--;
         state.turnComplete = false;
 
-        // Recalculate player score from scratch using buffered darts
         const player = currentPlayer();
         let score = state.turnScoreBefore;
         for (const d of state.pendingDarts) {
@@ -534,7 +501,6 @@
         }
         player.score = score;
 
-        // Remove last pill from UI
         const dartsRow = document.getElementById(`darts-${player.id}`);
         if (dartsRow && dartsRow.lastChild) dartsRow.removeChild(dartsRow.lastChild);
 
@@ -551,14 +517,12 @@
     async function onNextPlayer() {
         if (!state.turnComplete || state.cpuTurnRunning || currentPlayer().isCpu) return;
 
-        // Submit pending darts to server, then advance
         if (state.pendingDarts.length > 0) {
             UI.setLoading(true);
             try {
                 const serverResult = await _submitPendingTurn();
                 state.pendingDarts = [];
 
-                // Apply server's checkout suggestion now that we have it
                 if (serverResult && serverResult.checkout_suggestion) {
                     const next = state.players[(state.currentIndex + 1) % state.players.length];
                     if (next) UI.setCheckoutHint(next.id, serverResult.checkout_suggestion);
@@ -566,7 +530,6 @@
             } catch (err) {
                 UI.showToast(`SYNC ERROR: ${err.message}`, 'bust', 4000);
                 console.error('[app] Turn submit error:', err);
-                // Still advance — don't block the game on a network hiccup
             } finally {
                 UI.setLoading(false);
             }
@@ -624,7 +587,6 @@
         try {
             const result = await API.restartMatch(state.matchId);
 
-            // Reset all player scores locally
             state.players.forEach(function(p) {
                 p.score = state.startingScore;
             });
@@ -645,23 +607,20 @@
     }
 
     // ------------------------------------------------------------------
-    // Stats
+    // Game launchers
     // ------------------------------------------------------------------
 
     function _onPractice() {
         API.getPlayers().then(function(existing) {
             PRACTICE.showSetup(
                 existing,
-                // onBack — return to setup screen
                 function() {
                     API.getPlayers().then(function(p) {
                         UI.buildSetupScreen(p, onStartGame, _onViewStats, _onPractice, _onCricket, _onShanghai, _onBaseball, _onKiller, _onNineLives, _onBermuda, _onRace1000);
                     });
                 },
-                // onStart — begin the practice session
                 function(config) {
                     PRACTICE.start(config, function() {
-                        // onEnd — back to setup after session
                         API.getPlayers().then(function(p) {
                             UI.buildSetupScreen(p, onStartGame, _onViewStats, _onPractice, _onCricket, _onShanghai, _onBaseball, _onKiller, _onNineLives, _onBermuda, _onRace1000);
                         });
@@ -708,7 +667,6 @@
 
         UI.appendSetupHeader(inner, 'Race to 1000');
 
-        // Variant
         var varSection = document.createElement('div');
         varSection.className = 'setup-section';
         varSection.innerHTML = '<div class="setup-label">SCORING VARIANT</div>';
@@ -733,7 +691,6 @@
         varSection.appendChild(varRow);
         inner.appendChild(varSection);
 
-        // Player count — 1 = vs CPU, 2–4 = multiplayer
         var countSection = document.createElement('div');
         countSection.className = 'setup-section';
         countSection.innerHTML = '<div class="setup-label">NUMBER OF PLAYERS</div>';
@@ -815,7 +772,6 @@
 
         UI.appendSetupHeader(inner, 'Bermuda Triangle');
 
-        // Player count — 1 = vs CPU, 2–4 = multiplayer
         var countSection = document.createElement('div');
         countSection.className = 'setup-section';
         countSection.innerHTML = '<div class="setup-label">NUMBER OF PLAYERS</div>';
@@ -880,9 +836,7 @@
     }
 
     function _onNineLives() {
-        API.getPlayers().then(function (existing) {
-            _showNineLivesSetup(existing);
-        });
+        API.getPlayers().then(function (existing) { _showNineLivesSetup(existing); });
     }
 
     function _showNineLivesSetup(existingPlayers) {
@@ -897,7 +851,6 @@
 
         UI.appendSetupHeader(inner, 'Nine Lives');
 
-        // Player count — 1 = vs CPU, 2–4 = multiplayer
         var countSection = document.createElement('div');
         countSection.className = 'setup-section';
         countSection.innerHTML = '<div class="setup-label">NUMBER OF PLAYERS</div>';
@@ -966,9 +919,7 @@
     }
 
     function _onKiller() {
-        API.getPlayers().then(function(existing) {
-            _showKillerSetup(existing);
-        });
+        API.getPlayers().then(function(existing) { _showKillerSetup(existing); });
     }
 
     function _showKillerSetup(existingPlayers) {
@@ -983,7 +934,6 @@
 
         UI.appendSetupHeader(inner, 'Killer');
 
-        // Variant selection
         var variantSection = document.createElement('div');
         variantSection.className = 'setup-section';
         variantSection.innerHTML = '<div class="setup-label">VARIANT</div>';
@@ -1009,7 +959,6 @@
         variantSection.appendChild(variantRow);
         inner.appendChild(variantSection);
 
-        // Player count — 1 = vs CPU, 2-6 = multiplayer
         var countSection = document.createElement('div');
         countSection.className = 'setup-section';
         countSection.innerHTML = '<div class="setup-label">NUMBER OF PLAYERS</div>';
@@ -1043,13 +992,11 @@
         countSection.appendChild(countRow);
         inner.appendChild(countSection);
 
-        // Player slots
         var namesSection = document.createElement('div');
         namesSection.className = 'setup-section';
         inner.appendChild(namesSection);
         UI.renderCricketPlayerSlots(existingPlayers, 2, namesSection);
 
-        // Start button
         var startBtn = document.createElement('button');
         startBtn.className = 'start-btn';
         startBtn.textContent = 'START MATCH';
@@ -1083,9 +1030,7 @@
     }
 
     function _onBaseball() {
-        API.getPlayers().then(function(existing) {
-            _showBaseballSetup(existing);
-        });
+        API.getPlayers().then(function(existing) { _showBaseballSetup(existing); });
     }
 
     function _showBaseballSetup(existingPlayers) {
@@ -1100,7 +1045,6 @@
 
         UI.appendSetupHeader(inner, 'Baseball');
 
-        // Player count — 1 = vs CPU, 2-4 = multiplayer
         var countSection = document.createElement('div');
         countSection.className = 'setup-section';
         countSection.innerHTML = '<div class="setup-label">NUMBER OF PLAYERS</div>';
@@ -1134,13 +1078,11 @@
         countSection.appendChild(countRow);
         inner.appendChild(countSection);
 
-        // Player slots
         var namesSection = document.createElement('div');
         namesSection.className = 'setup-section';
         inner.appendChild(namesSection);
         UI.renderCricketPlayerSlots(existingPlayers, 2, namesSection);
 
-        // Start button
         var startBtn = document.createElement('button');
         startBtn.className = 'start-btn';
         startBtn.textContent = 'START MATCH';
@@ -1183,10 +1125,8 @@
         inner.className = 'setup-screen-inner';
         app.appendChild(inner);
 
-        // Standard header
         UI.appendSetupHeader(inner, 'Cricket');
 
-        // Player count
         var countSection = document.createElement('div');
         countSection.className = 'setup-section';
         countSection.innerHTML = '<div class="setup-label">NUMBER OF PLAYERS</div>';
@@ -1222,13 +1162,11 @@
         countSection.appendChild(countRow);
         inner.appendChild(countSection);
 
-        // Player name slots
         var namesSection = document.createElement('div');
         namesSection.className = 'setup-section';
         inner.appendChild(namesSection);
         UI.renderCricketPlayerSlots(existingPlayers, 2, namesSection);
 
-        // Start button
         var startBtn = document.createElement('button');
         startBtn.className = 'start-btn';
         startBtn.textContent = 'START MATCH';
@@ -1247,7 +1185,6 @@
         inner.appendChild(_makeSetupRulesBtn('cricket'));
         inner.appendChild(startBtn);
 
-        // Back link at bottom
         var backLink = document.createElement('button');
         backLink.className = 'setup-back-link';
         backLink.type = 'button';
@@ -1272,7 +1209,6 @@
 
         UI.appendSetupHeader(inner, 'Shanghai');
 
-        // Game length
         var lengthSection = document.createElement('div');
         lengthSection.className = 'setup-section';
         lengthSection.innerHTML = '<div class="setup-label">GAME LENGTH</div>';
@@ -1298,7 +1234,6 @@
         lengthSection.appendChild(lengthRow);
         inner.appendChild(lengthSection);
 
-        // Player count
         var countSection = document.createElement('div');
         countSection.className = 'setup-section';
         countSection.innerHTML = '<div class="setup-label">NUMBER OF PLAYERS</div>';
@@ -1381,7 +1316,6 @@
         }
         STATS.showPlayerPicker(humans, (player) => {
             STATS.showStatsScreen(player, async () => {
-                // Back button → return to setup screen
                 const existing = await API.getPlayers().catch(() => []);
                 UI.buildSetupScreen(existing, onStartGame, _onViewStats, _onPractice, _onCricket, _onShanghai, _onBaseball, _onKiller, _onNineLives, _onBermuda, _onRace1000);
             });
