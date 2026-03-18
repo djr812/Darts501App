@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -10,6 +10,24 @@
     <title>Darts 501</title>
     <link rel="icon" type="image/png" href="/favicon.png">
     <link rel="apple-touch-icon" href="/favicon.png">
+    <script>
+    // Android: env(safe-area-inset-top) often returns 0 in Capacitor WebView.
+    // Measure the actual status bar height via window.screen and inject it
+    // as a CSS variable so the app header clears the system status bar.
+    (function() {
+        var el = document.createElement('div');
+        el.style.cssText = 'position:fixed;top:env(safe-area-inset-top);left:0;width:1px;height:1px;';
+        document.documentElement.appendChild(el);
+        var inset = el.getBoundingClientRect().top;
+        document.documentElement.removeChild(el);
+        if (!inset || inset < 1) {
+        // env() returned 0 — apply Android fallback (24dp is standard status bar)
+        document.documentElement.style.setProperty('--sat', '24px');
+        } else {
+        document.documentElement.style.setProperty('--sat', inset + 'px');
+        }
+    })();
+    </script>
     <link rel="stylesheet" href="/css/app.css">
 </head>
 <body>

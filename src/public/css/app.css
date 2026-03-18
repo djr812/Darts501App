@@ -69,9 +69,10 @@ html, body {
     font-family: var(--font-display);
     font-size: 16px;
     -webkit-font-smoothing: antialiased;
+    /* ── Safe area insets: keeps content clear of status bar and nav bar ── */
+    padding-top: env(--sat, safe-area-inset-top);
+    padding-bottom: env(safe-area-inset-bottom);
 }
-
-
 
 /* Prevent iOS text size adjustment on rotation */
 body {
@@ -165,6 +166,8 @@ body.mode-stats #app {
     -webkit-align-items: center;
     align-items: center;
     padding: 0 12px;
+    padding-left: max(12px, env(safe-area-inset-left));
+    padding-right: max(12px, env(safe-area-inset-right));
     background: var(--bg-surface);
     border-bottom: 1px solid var(--border);
     height: 52px;
@@ -727,9 +730,10 @@ body[data-multiplier="3"] .seg-btn:active { background: #0a3a1a; color: var(--tr
     -webkit-justify-content: center;
     justify-content: center;
     padding: 4px 10px;
+    padding-bottom: max(4px, env(safe-area-inset-bottom));
     background: var(--bg-surface);
     border-top: 1px solid var(--border);
-    height: 36px;
+    height: calc(36px + env(safe-area-inset-bottom));
     -webkit-box-sizing: border-box;
     box-sizing: border-box;
 }
@@ -1946,7 +1950,6 @@ body[data-multiplier="3"] .seg-btn:active { background: #0a3a1a; color: var(--tr
 .analysis-response.done {
     border-color: var(--border);
     color: var(--text-primary);
-    /* Switch from pre-wrap to normal flow once markdown is rendered */
     white-space: normal;
 }
 
