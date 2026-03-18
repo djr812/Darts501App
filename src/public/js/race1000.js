@@ -21,7 +21,6 @@ var RACE1000_GAME = (function () {
     var _R1K_RING_CY   = 64;
     var _R1K_RING_CIRC = +(2 * Math.PI * 54).toFixed(4);
 
-    // ── State ─────────────────────────────────────────────────────────────────
     var _state = {
         matchId:            null,
         players:            [],
@@ -42,8 +41,6 @@ var RACE1000_GAME = (function () {
 
     var _pendingThrows = [];
     var _throwHistory  = [];
-
-    // ── Public ────────────────────────────────────────────────────────────────
 
     function start(config, onEnd) {
         _state.matchId            = null;
@@ -109,8 +106,6 @@ var RACE1000_GAME = (function () {
             });
     }
 
-    // ── Player resolution ─────────────────────────────────────────────────────
-
     function _resolvePlayers(selections) {
         return Promise.all(selections.map(function (sel) {
             if (sel.isCpu) {
@@ -130,8 +125,6 @@ var RACE1000_GAME = (function () {
             return API.createPlayer(sel.name).then(function (p) { return { id: p.id, name: p.name, isCpu: false }; });
         }));
     }
-
-    // ── State helpers ─────────────────────────────────────────────────────────
 
     function _applyState(s) {
         _state.matchId = s.match_id;
@@ -163,8 +156,6 @@ var RACE1000_GAME = (function () {
         return _state.players.find(function (p) { return String(p.id) === String(id); }) || null;
     }
 
-    // ── Score dart locally ────────────────────────────────────────────────────
-
     function _scoreDart(segment, multiplier) {
         if (segment === 0) return 0;
         if (_state.variant === 'twenties') return segment === 20 ? segment * multiplier : 0;
@@ -174,8 +165,6 @@ var RACE1000_GAME = (function () {
     function _turnTotal() {
         return _pendingThrows.reduce(function (sum, t) { return sum + t.points; }, 0);
     }
-
-    // ── Build screen ──────────────────────────────────────────────────────────
 
     function _buildScreen() {
         ['confirm-modal', 'rules-modal'].forEach(function (id) {
@@ -315,8 +304,6 @@ var RACE1000_GAME = (function () {
         _applyHighlights();
     }
 
-    // ── Leader detection ──────────────────────────────────────────────────────
-
     function _leaderId() {
         var maxScore = -1;
         var leader   = null;
@@ -332,8 +319,6 @@ var RACE1000_GAME = (function () {
         var lid = _leaderId();
         return (lid !== null && String(playerId) === String(lid)) ? 'leader' : 'trailing';
     }
-
-    // ── SVG ring helpers ──────────────────────────────────────────────────────
 
     function _renderCards(container) {
         container.innerHTML = '';
@@ -448,7 +433,6 @@ var RACE1000_GAME = (function () {
         });
     }
 
-    // Update the ring for the current player immediately during a turn
     function _updateCurrentPlayerRing() {
         var cp = _currentPlayer();
         if (!cp) return;
@@ -481,8 +465,6 @@ var RACE1000_GAME = (function () {
         if (banner) banner.textContent = p.name.toUpperCase() + '  —  ' + varStr;
         if (footer) footer.textContent = need > 0 ? 'NEEDS ' + need + ' MORE TO WIN' : 'TARGET REACHED!';
     }
-
-    // ── Segment grid ──────────────────────────────────────────────────────────
 
     function _buildGrid() {
         var grid = document.createElement('div');
@@ -539,8 +521,6 @@ var RACE1000_GAME = (function () {
         if (tabs) tabs.querySelectorAll('.tab-btn').forEach(function (b) { b.disabled = locked; });
     }
 
-    // ── Throw handling ────────────────────────────────────────────────────────
-
     function _onThrow(segment, multiplier) {
         if (_state.setComplete || _state.status !== 'active') return;
         if (_state.cpuTurnRunning && !_isCpuPlayer(_currentPlayer())) return;
@@ -556,7 +536,6 @@ var RACE1000_GAME = (function () {
         _addPill(segment, multiplier, pts);
         var dartDuration = _speakDart(segment, multiplier, pts);
 
-        // Update sub-label and ring immediately after each dart
         _updateTurnSub();
         _updateCurrentPlayerRing();
 
@@ -571,14 +550,11 @@ var RACE1000_GAME = (function () {
         }
     }
 
-    // ── Next ──────────────────────────────────────────────────────────────────
-
     function _onNext() {
         UI.setLoading(true);
         var throws   = _pendingThrows.slice();
         var turnNum  = _state.turnNumber;
 
-        // Capture turn score NOW before _clearTurn wipes pendingThrows
         var capturedTurnScore = throws.reduce(function (sum, t) { return sum + (t.points || 0); }, 0);
 
         var submitPromise = throws.length > 0
@@ -645,7 +621,6 @@ var RACE1000_GAME = (function () {
                         afterDelay += 600 + tsMsg.length * 75;
                     }
                 } else if (scoredEv || capturedTurnScore >= 0) {
-                    // Build a speech event with the correct turn delta
                     var speakEv = Object.assign({}, scoredEv || {}, {
                         player_id:   (scoredEv && scoredEv.player_id) || _state.currentPlayerId,
                         turn_points: capturedTurnScore,
@@ -668,8 +643,6 @@ var RACE1000_GAME = (function () {
             });
     }
 
-    // ── CPU turn ──────────────────────────────────────────────────────────────
-
     function _runCpuTurn() {
         if (_state.cpuTurnRunning || _state.status !== 'active') return;
         if (!_isCpuPlayer(_currentPlayer())) return;
@@ -686,7 +659,11 @@ var RACE1000_GAME = (function () {
             }
             var dart = _cpuChooseDart();
             dartsThrown++;
-            var speechDur = _speakDart(dart.segment, dart.multiplier, 0);
+            // _onThrow calls _speakDart internally — estimate duration without calling it again
+            var label = dart.segment === 0 ? 'Miss' :
+                        dart.segment === 25 ? (dart.multiplier === 2 ? 'Bulls Eye' : 'Outer bull') :
+                        (dart.multiplier === 3 ? 'Treble ' : dart.multiplier === 2 ? 'Double ' : '') + dart.segment;
+            var speechDur = SPEECH.isEnabled() ? 300 + label.length * 120 : 0;
             _onThrow(dart.segment, dart.multiplier);
             var nextDelay = Math.max(1000, speechDur + 450);
             setTimeout(_throwNext, nextDelay);
@@ -810,8 +787,6 @@ var RACE1000_GAME = (function () {
         });
     }
 
-    // ── Undo ──────────────────────────────────────────────────────────────────
-
     function _onUndo() {
         if (_state.cpuTurnRunning) return;
         if (_throwHistory.length === 0) return;
@@ -835,8 +810,6 @@ var RACE1000_GAME = (function () {
         _updateTurnSub();
         _updateCurrentPlayerRing();
     }
-
-    // ── End / Restart ─────────────────────────────────────────────────────────
 
     function _onRestart() {
         UI.showConfirmModal({
@@ -878,8 +851,6 @@ var RACE1000_GAME = (function () {
             }
         });
     }
-
-    // ── Result screen ─────────────────────────────────────────────────────────
 
     function _showResult(winnerEv) {
         var winnerPl = _playerById(winnerEv.player_id) ||
@@ -937,8 +908,6 @@ var RACE1000_GAME = (function () {
         }
     }
 
-    // ── Pills ─────────────────────────────────────────────────────────────────
-
     function _addPill(segment, multiplier, points) {
         var pills = document.getElementById('r1k-pills');
         if (!pills) return;
@@ -951,8 +920,6 @@ var RACE1000_GAME = (function () {
         pill.textContent = points > 0 ? segStr + ' +' + points : segStr;
         pills.appendChild(pill);
     }
-
-    // ── Speech ────────────────────────────────────────────────────────────────
 
     function _announcePlayer(isFirst) {
         if (!SPEECH.isEnabled()) return 0;
@@ -994,8 +961,6 @@ var RACE1000_GAME = (function () {
         }, 300);
         return 300 + 2600 + msg.length * 95;
     }
-
-    // ── Helpers ───────────────────────────────────────────────────────────────
 
     function _esc(str) {
         return String(str)
