@@ -336,8 +336,30 @@
                     setTimeout(_advancePlayer, 2200);
 
                 } else {
+                    // Announce turn total and remaining, then wait for speech to finish
+                    // before advancing — fixes: (1) turn total firing before last dart,
+                    // (2) turn total never being announced for CPU.
+                    const turnScored = state.turnScoreBefore - cpuPlayer.score;
+                    const lastDartPhrase = lastResult ? lastResult.points : 0;
+                    // Estimate last dart speech duration, then chain turn total after it
+                    const lastDartLabel = (() => {
+                        const d = state.pendingDarts[state.pendingDarts.length - 1];
+                        if (!d) return '';
+                        if (d.segment === 0) return 'Miss';
+                        if (d.segment === 25) return d.multiplier === 2 ? 'Bulls Eye' : 'Outer bull';
+                        const mul = d.multiplier === 3 ? 'Treble ' : d.multiplier === 2 ? 'Double ' : '';
+                        return mul + d.segment;
+                    })();
+                    const lastDartDur = SPEECH.isEnabled() ? 300 + lastDartLabel.length * 120 : 0;
                     state.turnComplete = true;
-                    setTimeout(_advancePlayer, 2000);
+                    // Delay turn total until after last dart speech finishes
+                    setTimeout(() => {
+                        SPEECH.announceTurnEnd(turnScored, cpuPlayer.score);
+                        // Estimate turn total speech duration then advance player
+                        const totalPhrase = String(turnScored) + String(cpuPlayer.score);
+                        const totalDur = SPEECH.isEnabled() ? 1800 + totalPhrase.length * 80 : 400;
+                        setTimeout(_advancePlayer, totalDur);
+                    }, lastDartDur + 200);
                 }
             }
         );
